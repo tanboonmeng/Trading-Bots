@@ -55,7 +55,7 @@ from utils.client_id_manager import get_or_allocate_client_id, bump_client_id
 APP_NAME = "0DTE_Black_Bear"
 
 HOST = "127.0.0.1"
-PORT = 7497  # 7496 live, 7497 paper
+PORT = 4002  # 7496 live, 7497 paper
 ACCOUNT_ID = "DU3188670"
 
 SYMBOL = "SPX"
