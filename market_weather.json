@@ -1,0 +1,19 @@
+{
+    "last_updated": "2025-12-25 08:00:44",
+    "data_date": "2025-12-24",
+    "market_condition": {
+        "regime_code": 1,
+        "regime_desc": "\u2600\ufe0f  Calm",
+        "forecast_5d_code": 1,
+        "forecast_5d_desc": "\u2600\ufe0f  Calm"
+    },
+    "strategy_commands": {
+        "mean_reversion": "GO",
+        "trend": "STOP",
+        "breakout": "WATCH",
+        "option_selling": "GO",
+        "option_buying": "STOP",
+        "pairs_trading": "GO",
+        "event_driven": "GO"
+    }
+}
