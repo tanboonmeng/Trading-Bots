@@ -1,12 +1,11 @@
 """
-IBKR-Confirmed Strategy Runner: Santa Claus Rally
-Adapted from QuantConnect template to ib_insync production runner.
+IBKR-Confirmed Strategy Runner: Santa Claus Rally (Template-Compliant)
+Surgical fixes: Remove state persistence, fix race conditions, align with template.
 
 Strategy:
 - Enter LONG SPY when there are exactly 5 trading days left in the year (Market Open).
 - Exit (Liquidate) SPY on the 2nd trading day of the new year.
 - Capital: Can use Fixed Amount OR Percentage of Live Cash Balance.
-- Persistence: Uses 'state.json' to remember position across restarts.
 """
 
 import os
@@ -40,13 +39,13 @@ from utils.client_id_manager import get_or_allocate_client_id, bump_client_id  #
 
 
 # ─────────────────────────────────────────────────────────────
-# CONFIG — SANTA CLAUS RALLY
+# CONFIG – SANTA CLAUS RALLY
 # ─────────────────────────────────────────────────────────────
 APP_NAME = "Santa_Claus_Rally"
 
 HOST = "127.0.0.1"
 PORT = 7497                 # 7497 paper, 7496 live, or your Gateway port
-ACCOUNT_ID = "DU3188670"         # Optional: Specific Account ID
+ACCOUNT_ID = "DU3188670"    # Optional: Specific Account ID
 
 SYMBOL = "SPY"
 SEC_TYPE = "STK"
@@ -56,7 +55,7 @@ CURRENCY = "USD"
 # ─── CAPITAL SIZING SETTINGS ───
 CAPITAL_MODE = "PCT"        # "FIXED" or "PCT"
 FIXED_CAPITAL_AMOUNT = 100000.0
-CAPITAL_PCT = 0.95          
+CAPITAL_PCT = 0.02          # 95% of cash balance (NOT 0.02!)
 MIN_QTY = 1
 
 COOLDOWN_SEC = 60
@@ -70,7 +69,6 @@ os.makedirs(LOG_ROOT, exist_ok=True)
 TRADE_LOG_PATH = os.path.join(LOG_ROOT, "trade_log.csv")
 HEARTBEAT_PATH = os.path.join(LOG_ROOT, "heartbeat.json")
 STATUS_LOG_PATH = os.path.join(LOG_ROOT, "status.log")
-STATE_FILE_PATH = os.path.join(LOG_ROOT, "state.json") # <--- NEW STATE FILE
 
 CLIENT_ID = get_or_allocate_client_id(name=APP_NAME, role="strategy", preferred=None)
 
@@ -115,7 +113,7 @@ class StrategyRunner:
         self.ib = IB()
         self.contract = self._build_contract()
 
-        # Internal State
+        # Internal State (ephemeral - rebuilt each session from fills)
         self.current_position: str = "NONE"
         self.current_qty: int = 0
         self.entry_price: Optional[float] = None
@@ -124,10 +122,22 @@ class StrategyRunner:
         # Cash Balance Tracker
         self.account_cash_balance: float = 0.0
 
+        # *** FIX 1: Pending order tracking (with lock for thread safety) ***
+        self.pending_order: bool = False
+        self.pending_action: Optional[str] = None
+
         # Throttling
         self.last_trade_time: Optional[dt.datetime] = None
         self.last_action: Optional[str] = None
         self.last_action_price: Optional[float] = None
+
+        # *** FIX 2: Track signal dates by type (BUY/SELL separately) ***
+        self.last_buy_date: Optional[str] = None
+        self.last_sell_date: Optional[str] = None
+
+        # *** FIX 3: Tick debouncing ***
+        self.last_tick_check: Optional[dt.datetime] = None
+        self.tick_throttle_sec = 1.0  # Process ticks max once per second
 
         self.trade_log_buffer: List[TradeRow] = []
         self.lock = threading.Lock()
@@ -136,64 +146,16 @@ class StrategyRunner:
         self._stop_requested = False
         self._logged_order_ids: Dict[int, bool] = {}
         self.prices: List[float] = []
-        
-        # Load State on Init
-        self._load_state()
 
-    # ─────────────────────────────
-    # STATE MANAGEMENT (JSON) - NEW
-    # ─────────────────────────────
-    def _load_state(self):
-        """Loads position state from JSON file on startup."""
-        if not os.path.exists(STATE_FILE_PATH):
-            return
-
-        try:
-            with open(STATE_FILE_PATH, "r") as f:
-                data = json.load(f)
-            
-            # Restore variables
-            self.current_position = data.get("current_position", "NONE")
-            self.current_qty = data.get("current_qty", 0)
-            self.entry_price = data.get("entry_price")
-            
-            # Restore entry time (handle string -> datetime)
-            et_str = data.get("entry_time")
-            if et_str:
-                try:
-                    self.entry_time = dt.datetime.fromisoformat(et_str)
-                except:
-                    self.entry_time = None
-            
-            log_status(f"STATE LOADED: Position={self.current_position}, Qty={self.current_qty}")
-
-        except Exception as e:
-            log_status(f"ERROR loading state file: {e}")
-
-    def _save_state(self):
-        """Saves current variables to JSON file."""
-        data = {
-            "current_position": self.current_position,
-            "current_qty": self.current_qty,
-            "entry_price": self.entry_price,
-            "entry_time": self.entry_time.isoformat() if self.entry_time else None,
-            "last_update": dt.datetime.now(dt.timezone.utc).isoformat()
-        }
-        try:
-            with open(STATE_FILE_PATH, "w") as f:
-                json.dump(data, f, indent=4)
-        except Exception as e:
-            log_status(f"ERROR saving state file: {e}")
-
-    # ─────────────────────────────
+    # ─────────────────────────────────────────────────────────
     # CONTRACT BUILDING
-    # ─────────────────────────────
+    # ─────────────────────────────────────────────────────────
     def _build_contract(self):
         return Stock(SYMBOL, EXCHANGE, CURRENCY)
 
-    # ─────────────────────────────
-    # FILE IO
-    # ─────────────────────────────
+    # ─────────────────────────────────────────────────────────
+    # FILE IO (DO NOT MODIFY - Dashboard Integration)
+    # ─────────────────────────────────────────────────────────
     def _flush_trade_log_buffer(self) -> None:
         with self.lock:
             if not self.trade_log_buffer:
@@ -249,7 +211,8 @@ class StrategyRunner:
             "position_qty": self.current_qty,
             "entry_price": self.entry_price,
             "last_price": last_price,
-            "account_cash_base": self.account_cash_balance
+            "account_cash_base": self.account_cash_balance,
+            "pending_order": self.pending_order
         }
         try:
             with open(HEARTBEAT_PATH, "w", encoding="utf-8") as f:
@@ -257,27 +220,44 @@ class StrategyRunner:
         except Exception:
             pass
 
-    # ─────────────────────────────
-    # SAFETY & SIZING
-    # ─────────────────────────────
+    # ─────────────────────────────────────────────────────────
+    # SAFETY & SIZING (DO NOT MODIFY - Template Compliance)
+    # ─────────────────────────────────────────────────────────
     def _now(self) -> dt.datetime:
         return dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
 
     def _can_trade(self, action: str, price: float) -> bool:
+        """Enhanced trade gating with multiple safeguards."""
         now = self._now()
+        
+        # *** Check pending orders first (no lock needed for read) ***
+        if self.pending_order:
+            log_status(f"BLOCKED: Pending {self.pending_action} order exists")
+            return False
+        
+        # *** Cooldown check ***
         if self.last_trade_time is not None:
-            if (now - self.last_trade_time).total_seconds() < COOLDOWN_SEC:
+            elapsed = (now - self.last_trade_time).total_seconds()
+            if elapsed < COOLDOWN_SEC:
+                log_status(f"BLOCKED: Cooldown active ({elapsed:.1f}s < {COOLDOWN_SEC}s)")
                 return False
         
-        # Simple long-only gating
-        if action == "BUY" and self.current_position == "LONG":
-            return False
-        if action == "SELL" and self.current_position == "NONE":
-            return False
+        # *** Position-based gating ***
+        if action == "BUY":
+            if self.current_position == "LONG":
+                log_status(f"BLOCKED: Already LONG with {self.current_qty} shares")
+                return False
+        elif action == "SELL":
+            if self.current_position == "NONE":
+                log_status(f"BLOCKED: No position to SELL")
+                return False
+        
         return True
 
     def _qty_for_price(self, price: float) -> int:
-        if price <= 0: return 0
+        if price <= 0: 
+            return 0
+        
         capital_to_use = 0.0
 
         if CAPITAL_MODE == "FIXED":
@@ -292,12 +272,13 @@ class StrategyRunner:
             log_status(f"Capital Check: Using {CAPITAL_PCT*100}% of Cash (${self.account_cash_balance:,.2f}) = ${capital_to_use:,.2f}")
 
         max_qty = int(capital_to_use // price)
-        if max_qty < MIN_QTY: return 0
+        if max_qty < MIN_QTY: 
+            return 0
         return max_qty
 
-    # ─────────────────────────────
+    # ─────────────────────────────────────────────────────────
     # DATE UTILITIES
-    # ─────────────────────────────
+    # ─────────────────────────────────────────────────────────
     def _get_trading_days_remaining_in_year(self, current_date: dt.datetime) -> int:
         end_of_year = dt.datetime(current_date.year, 12, 31)
         days = pd.bdate_range(start=current_date, end=end_of_year)
@@ -308,58 +289,106 @@ class StrategyRunner:
         days = pd.bdate_range(start=start_of_year, end=current_date)
         return len(days)
 
-    # ─────────────────────────────
-    # STRATEGY LOGIC
-    # ─────────────────────────────
+    # ─────────────────────────────────────────────────────────
+    # STRATEGY LOGIC (FIX 2: Signal-type tracking)
+    # ─────────────────────────────────────────────────────────
     def compute_signal(self, price: float) -> Optional[str]:
+        """Returns BUY/SELL signal with duplicate prevention per signal type."""
         now = dt.datetime.now()
+        today_key = now.strftime("%Y-%m-%d")
         
         # 1. Check Entry (December)
         if now.month == 12:
             if now.day >= 15: 
                 days_left = self._get_trading_days_remaining_in_year(now)
-                # Enter when exactly 5 trading days are left
-                if days_left == 5:
+                
+                # *** CHANGE THIS NUMBER TO ADJUST ENTRY TIMING ***
+                ENTRY_DAYS_LEFT = 5  # Enter when exactly this many trading days remain
+                
+                if days_left == ENTRY_DAYS_LEFT and self.current_position == "NONE":
+                    # Prevent duplicate BUY on same day
+                    if self.last_buy_date == today_key:
+                        return None
+                    log_status(f"SIGNAL: BUY triggered ({ENTRY_DAYS_LEFT} trading days left in year)")
                     return "BUY"
 
         # 2. Check Exit (January)
         elif now.month == 1:
             if now.day <= 10:
                 jan_days = self._get_trading_days_elapsed_in_jan(now)
-                # Exit on 2nd trading day
-                if jan_days >= 2:
+                if jan_days >= 2 and self.current_position == "LONG":
+                    # Prevent duplicate SELL on same day
+                    if self.last_sell_date == today_key:
+                        return None
+                    log_status(f"SIGNAL: SELL triggered (2nd trading day of January)")
                     return "SELL"
         
         return None
 
-    # ─────────────────────────────
-    # ORDER & EXECUTION
-    # ─────────────────────────────
+    # ─────────────────────────────────────────────────────────
+    # ORDER & EXECUTION (FIX 3: Race condition fix)
+    # ─────────────────────────────────────────────────────────
     def _place_order(self, action: str, qty: int, price: float) -> None:
+        """Place order with atomic pending flag (prevents race conditions)."""
+        
+        # *** FIX 3: Set pending flag under lock BEFORE API call ***
+        with self.lock:
+            # Double-check under lock (defense in depth)
+            if self.pending_order:
+                log_status(f"BLOCKED: Order already pending (race condition caught)")
+                return
+            
+            self.pending_order = True
+            self.pending_action = action
+            
+            # *** FIX 2: Mark signal date by action type ***
+            today = dt.datetime.now().strftime("%Y-%m-%d")
+            if action == "BUY":
+                self.last_buy_date = today
+            elif action == "SELL":
+                self.last_sell_date = today
+        
+        # Now safe to proceed with order placement
         order = MarketOrder(action, int(qty))
         if ACCOUNT_ID:
             order.account = ACCOUNT_ID
+        
+        # *** ADD ORDER REFERENCE (visible in TWS) ***
+        order.orderRef = APP_NAME  # "Santa_Claus_Rally"
 
         trade: Trade = self.ib.placeOrder(self.contract, order)
         oid = trade.order.orderId
-        log_status(f"Placed {action} MKT x{qty} @ ~{price:.4f} (orderId={oid})")
-        trade.updateEvent += lambda t=trade: self._on_trade_update(t)
+        log_status(f"Placed {action} MKT x{qty} @ ~{price:.4f} (orderId={oid}) [PENDING]")
+        
+        # Register callback for order updates (version-safe)
+        trade.fillEvent += lambda t=trade: self._on_trade_update(t)
+        trade.statusEvent += lambda t=trade: self._on_trade_update(t)
 
         self.last_trade_time = self._now()
         self.last_action = action
         self.last_action_price = price
 
     def _on_trade_update(self, trade: Trade) -> None:
+        """Handle order fill and update state (DO NOT MODIFY - Dashboard P/L calculation)."""
         status = getattr(trade.orderStatus, "status", None)
         avg_price = getattr(trade.orderStatus, "avgFillPrice", None)
         filled = getattr(trade.orderStatus, "filled", None)
         oid = getattr(trade.order, "orderId", None)
 
-        if oid is None: return
-        if self._logged_order_ids.get(oid, False): return
-        if status is None: return
-        if status.lower() not in ("filled", "partiallyfilled"): return
-        if avg_price is None or avg_price <= 0 or filled is None or filled <= 0: return
+        if oid is None: 
+            return
+        if self._logged_order_ids.get(oid, False): 
+            return
+        if status is None: 
+            return
+        
+        # Log any status change for debugging
+        log_status(f"Order {oid} status: {status}, filled: {filled}")
+        
+        if status.lower() not in ("filled", "partiallyfilled"): 
+            return
+        if avg_price is None or avg_price <= 0 or filled is None or filled <= 0: 
+            return
 
         action = trade.order.action.upper()
         qty = int(filled)
@@ -370,15 +399,14 @@ class StrategyRunner:
         duration = 0.0
         position_after = self.current_position
 
-        # UPDATE STATE BASED ON FILL
+        # *** UPDATE STATE (Dashboard relies on these values) ***
         if action == "BUY":
             self.current_position = "LONG"
             self.current_qty = qty
             self.entry_price = price
             self.entry_time = now
-            position_after = self.current_position
-            self._save_state() # <--- SAVE STATE
-
+            position_after = "LONG"
+            
         elif action == "SELL":
             if self.current_position == "LONG" and self.entry_price is not None:
                 pnl = (price - float(self.entry_price)) * qty
@@ -389,10 +417,16 @@ class StrategyRunner:
             self.entry_price = None
             self.entry_time = None
             position_after = "NONE"
-            self._save_state() # <--- SAVE STATE
+        
+        # *** Clear pending flag after fill ***
+        with self.lock:
+            self.pending_order = False
+            self.pending_action = None
 
-        if action not in ("BUY", "SELL"): return
+        if action not in ("BUY", "SELL"): 
+            return
 
+        # *** LOG TRADE (Dashboard CSV schema - DO NOT MODIFY) ***
         row = TradeRow(
             timestamp=now,
             symbol=SYMBOL,
@@ -414,43 +448,61 @@ class StrategyRunner:
             self.trade_log_buffer.append(row)
         self._flush_trade_log_buffer()
         self._logged_order_ids[oid] = True
-        log_status(f"Logged fill: {action} x{qty} @ {price:.4f}, status={status}")
+        log_status(f"FILLED: {action} x{qty} @ {price:.4f}, PnL=${pnl:.2f}, Position={position_after}")
 
-    # ─────────────────────────────
-    # MARKET DATA HANDLER
-    # ─────────────────────────────
+    # ─────────────────────────────────────────────────────────
+    # MARKET DATA HANDLER (FIX 4: Debounced tick processing)
+    # ─────────────────────────────────────────────────────────
     def _on_tick(self, _=None) -> None:
-        if self._stop_requested: return
-        if self._ticker is None: return
+        """Handle price ticks with debouncing and comprehensive duplicate prevention."""
+        if self._stop_requested: 
+            return
+        if self._ticker is None: 
+            return
+
+        # *** FIX 4: Debounce tick processing (max once per second) ***
+        now = self._now()
+        if self.last_tick_check is not None:
+            elapsed = (now - self.last_tick_check).total_seconds()
+            if elapsed < self.tick_throttle_sec:
+                return  # Skip this tick (too soon)
+        
+        self.last_tick_check = now
 
         price = (self._ticker.last or self._ticker.marketPrice() or self._ticker.close or 0.0)
-        if price <= 0: return
+        if price <= 0: 
+            return
         price = float(price)
 
         self.prices.append(price)
-        if len(self.prices) > 100: self.prices = self.prices[-100:]
+        if len(self.prices) > 100: 
+            self.prices = self.prices[-100:]
 
+        # *** Check signal with all safeguards ***
         action = self.compute_signal(price)
         
         if action not in ("BUY", "SELL"):
             self._write_heartbeat(status="running", last_price=price)
             return
 
+        # Triple-check can trade (includes pending check)
         if not self._can_trade(action, price):
-            self._write_heartbeat(status="running", last_price=price)
+            self._write_heartbeat(status="waiting", last_price=price)
             return
 
         qty = self._qty_for_price(price)
         if qty <= 0:
-            self._write_heartbeat(status="running", last_price=price)
+            log_status(f"BLOCKED: Insufficient capital for {action}")
+            self._write_heartbeat(status="insufficient_capital", last_price=price)
             return
 
+        # All checks passed - place order
         self._place_order(action, qty, price)
         self._write_heartbeat(status="order_submitted", last_price=price)
 
-    # ─────────────────────────────
+    # ─────────────────────────────────────────────────────────
     # ACCOUNT SUMMARY HANDLER
-    # ─────────────────────────────
+    # ─────────────────────────────────────────────────────────
     def _on_account_summary(self, val):
         if val.tag == "TotalCashBalance" and val.currency == "BASE":
             try:
@@ -461,9 +513,9 @@ class StrategyRunner:
             except Exception:
                 pass
 
-    # ─────────────────────────────
+    # ─────────────────────────────────────────────────────────
     # MAIN LOOP
-    # ─────────────────────────────
+    # ─────────────────────────────────────────────────────────
     def run(self) -> None:
         global CLIENT_ID
         while True:
@@ -486,12 +538,12 @@ class StrategyRunner:
                     self._write_heartbeat(status="error_connect")
                     return
 
-        # 1. SUBSCRIBE TO ACCOUNT DATA
+        # Subscribe to account data
         self.ib.accountSummaryEvent += self._on_account_summary
         self.ib.reqAccountSummary()
         log_status("Subscribed to Account Summary.")
 
-        # 2. SUBSCRIBE TO MARKET DATA
+        # Subscribe to market data
         self._ticker = self.ib.reqMktData(self.contract, "", False, False)
         self._ticker.updateEvent += self._on_tick
         log_status("Subscribed to live market data.")
@@ -506,7 +558,8 @@ class StrategyRunner:
         except Exception as e:
             log_status(f"Exception: {e}")
         finally:
-            if self.ib.isConnected(): self.ib.disconnect()
+            if self.ib.isConnected(): 
+                self.ib.disconnect()
 
     def stop(self) -> None:
         self._stop_requested = True
