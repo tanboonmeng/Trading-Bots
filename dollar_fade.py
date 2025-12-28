@@ -1,20 +1,17 @@
 """
 Santa Claus Rally / USD Fade Strategy Runner
-Adapted from QuantConnect for ib_insync (Interactive Brokers)
-WITH FIXED ENTRY/EXIT DATES AND EASTERN TIME
-
-Revised Features:
-1. FIXED: 'Year Wrap' bug (prevented Dec selling).
-2. FIXED: 'AttributeError' on trade events.
-3. FIXED: 'NaN' error on Forex pricing.
-4. SAFETY: Checks IBKR Portfolio on startup.
+Features:
+- Auto-Reconnection (Survives TWS Restarts)
+- Telegram Alerts (Entries, Exits, Disconnects)
+- ISOLATED STATE: Uses a JSON file to track positions (Safe for shared accounts)
+- Sustainable Logic (Throttled Ticks)
 """
 
 import os
 import sys
 import json
 import time
-import math  # REQUIRED for NaN checks
+import math
 import threading
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List
@@ -36,8 +33,9 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
-from utils.client_id_manager import get_or_allocate_client_id, bump_client_id  # type: ignore
-
+from utils.client_id_manager import get_or_allocate_client_id, bump_client_id
+# [NEW] Telegram Import
+from utils.telegram_alert import send_alert
 
 # ─────────────────────────────────────────────────────────────
 # CONFIGURATION
@@ -45,8 +43,8 @@ from utils.client_id_manager import get_or_allocate_client_id, bump_client_id  #
 APP_NAME = "Dollar_Fade"
 
 HOST = "127.0.0.1"
-PORT = 7497                 # 7497 paper, 7496 live (Gateway/TWS)
-ACCOUNT_ID = "DU3188670"    # Your Account ID
+PORT = 7497                 
+ACCOUNT_ID = "DU3188670"    
 
 # Symbol Config
 SYMBOL = "EURUSD"
@@ -64,12 +62,11 @@ EXIT_MONTH = 1
 EXIT_DAY = 2
 
 # ─── CAPITAL SIZING SETTINGS ───
-# Options: "FIXED" or "PERCENTAGE"
-CAPITAL_MODE = "FIXED"
+CAPITAL_MODE = "FIXED"      # "FIXED" or "PERCENTAGE"
 CAPITAL_FIXED_AMOUNT = 2000.0 
 CAPITAL_PCT = 0.02
 
-MIN_QTY = 1000               # FX minimum lot size
+MIN_QTY = 1000              # FX minimum lot size
 
 # Execution Safeguards
 COOLDOWN_SEC = 300           
@@ -83,6 +80,8 @@ os.makedirs(LOG_ROOT, exist_ok=True)
 TRADE_LOG_PATH = os.path.join(LOG_ROOT, "trade_log.csv")
 HEARTBEAT_PATH = os.path.join(LOG_ROOT, "heartbeat.json")
 STATUS_LOG_PATH = os.path.join(LOG_ROOT, "status.log")
+# [NEW] Isolated State File
+STATE_FILE = os.path.join(LOG_ROOT, "state_Dollar_Fade.json")
 
 CLIENT_ID = get_or_allocate_client_id(name=APP_NAME, role="strategy", preferred=None)
 
@@ -119,6 +118,35 @@ def log_status(msg: str) -> None:
     except Exception:
         pass
 
+# ─────────────────────────────────────────────────────────────
+# STATE MANAGEMENT (JSON)
+# ─────────────────────────────────────────────────────────────
+def load_state() -> Dict[str, Any]:
+    """Loads the isolated position state for THIS bot only."""
+    if not os.path.exists(STATE_FILE):
+        return {}
+    try:
+        with open(STATE_FILE, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        log_status(f"⚠️ Failed to load state file: {e}")
+        return {}
+
+def save_state(position: str, qty: int, entry_price: float, entry_time: Optional[dt.datetime]):
+    """Saves the current position to disk."""
+    data = {
+        "current_position": position,
+        "current_qty": qty,
+        "entry_price": entry_price,
+        "entry_time": entry_time.isoformat() if entry_time else None,
+        "last_updated": dt.datetime.now().isoformat()
+    }
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        log_status(f"⚠️ Failed to save state: {e}")
+
 
 # ─────────────────────────────────────────────────────────────
 # STRATEGY RUNNER
@@ -145,6 +173,13 @@ class StrategyRunner:
         self._stop_requested = False
         self._logged_order_ids: Dict[int, bool] = {}
         self.prices: List[float] = []
+        
+        # SUSTAINABILITY: Tick Throttling
+        self.last_tick_check: Optional[dt.datetime] = None
+        self.tick_throttle_sec = 1.0 
+        
+        # Restore State on Init
+        self._restore_state()
 
     def _build_contract(self):
         if SEC_TYPE == "FX":
@@ -154,58 +189,38 @@ class StrategyRunner:
             return Stock(SYMBOL, EXCHANGE, CURRENCY)
         return IBContract(conId=0, symbol=SYMBOL, secType=SEC_TYPE, exchange=EXCHANGE, currency=CURRENCY)
 
-    # ─────────────────────────────
-    # STATE RESTORATION
-    # ─────────────────────────────
-    def _sync_initial_position(self):
-        """
-        Checks IBKR portfolio for EXISTING positions.
-        """
-        log_status("Checking IBKR Portfolio for existing positions...")
+    def _restore_state(self):
+        state = load_state()
+        pos = state.get("current_position", "NONE")
         
-        all_positions = self.ib.positions()
-        
-        found = False
-        for p in all_positions:
-            if (p.contract.symbol == SYMBOL and 
-                p.contract.secType == SEC_TYPE):
-                
-                if p.position != 0:
-                    self.current_qty = int(p.position)
-                    self.entry_price = p.avgCost
-                    
-                    if p.position > 0:
-                        self.current_position = "LONG"
-                        log_status(f"RESTORED FROM BROKER: Found LONG {SYMBOL} (Qty: {self.current_qty})")
-                    else:
-                        self.current_position = "SHORT"
-                        log_status(f"RESTORED FROM BROKER: Found SHORT {SYMBOL} (Qty: {self.current_qty})")
-                    
-                    found = True
-                    break 
-        
-        if not found:
-            log_status(f"No existing {SYMBOL} position found in IBKR. State is NONE.")
+        if pos in ["LONG", "SHORT"]:
+            self.current_position = pos
+            self.current_qty = int(state.get("current_qty", 0))
+            self.entry_price = float(state.get("entry_price", 0.0))
+            
+            t_str = state.get("entry_time")
+            if t_str:
+                try:
+                    self.entry_time = dt.datetime.fromisoformat(t_str)
+                except: pass
+            
+            log_status(f"♻️ RESTORED STATE: {self.current_position} {self.current_qty} {SYMBOL} @ {self.entry_price}")
+        else:
+            log_status("ℹ️ No active position in State File.")
 
     # ─────────────────────────────
     # FILE IO
     # ─────────────────────────────
     def _flush_trade_log_buffer(self) -> None:
         with self.lock:
-            if not self.trade_log_buffer:
-                return
+            if not self.trade_log_buffer: return
             rows = []
             for r in self.trade_log_buffer:
                 rows.append({
                     "timestamp": r.timestamp.isoformat(),
-                    "symbol": r.symbol,
-                    "action": r.action,
-                    "price": r.price,
-                    "quantity": r.quantity,
-                    "pnl": r.pnl,
-                    "duration": r.duration,
-                    "position": r.position,
-                    "status": r.status,
+                    "symbol": r.symbol, "action": r.action, "price": r.price,
+                    "quantity": r.quantity, "pnl": r.pnl, "duration": r.duration,
+                    "position": r.position, "status": r.status,
                     "ib_order_id": r.ib_order_id,
                     "extra": json.dumps(r.extra) if r.extra else None,
                 })
@@ -295,10 +310,8 @@ class StrategyRunner:
                 if cash_tag:
                     total_cash = float(cash_tag.value)
                     alloc = total_cash * CAPITAL_PCT
-                    log_status(f"Capital Calc: TotalCashBalance(BASE)={total_cash} * {CAPITAL_PCT} = {alloc}")
                     return alloc
                 else:
-                    log_status("Error: Could not find 'TotalCashBalance' with currency 'BASE'. Defaulting to 0.")
                     return 0.0
             except Exception as e:
                 log_status(f"Error fetching account summary: {e}")
@@ -347,26 +360,24 @@ class StrategyRunner:
     # ─────────────────────────────
     def _place_order(self, action: str, qty: int, price: float) -> None:
         order = MarketOrder(action, int(qty))
-        if ACCOUNT_ID:
-            order.account = ACCOUNT_ID
-        
+        if ACCOUNT_ID: order.account = ACCOUNT_ID
         order.orderRef = APP_NAME 
 
-        if action == "BUY":
-            self.current_position = "PENDING_BUY"
-        elif action == "SELL":
-            self.current_position = "PENDING_SELL"
+        if action == "BUY": self.current_position = "PENDING_BUY"
+        elif action == "SELL": self.current_position = "PENDING_SELL"
 
         trade: Trade = self.ib.placeOrder(self.contract, order)
-        oid = trade.order.orderId
-        log_status(f"Placed {action} MKT x{qty} @ ~{price:.4f} (orderId={oid}). State set to {self.current_position}")
-
-        # FIX: Use statusEvent
+        
+        # Matches original logic: statusEvent for updates
         trade.statusEvent += self._on_trade_update
         
         self.last_trade_time = self._now()
         self.last_action = action
         self.last_action_price = price
+        
+        msg = f"🚀 <b>[{APP_NAME}]</b> {action} MKT x{qty} @ ~{price:.4f}"
+        log_status(msg)
+        send_alert(msg, APP_NAME)
 
     def _on_trade_update(self, trade: Trade) -> None:
         status = getattr(trade.orderStatus, "status", None)
@@ -379,7 +390,6 @@ class StrategyRunner:
         
         status_lower = status.lower()
         if status_lower not in ("filled", "partiallyfilled"): return
-        
         if filled is None or filled <= 0: return
 
         action = trade.order.action.upper()
@@ -397,11 +407,12 @@ class StrategyRunner:
             self.entry_price = price
             self.entry_time = now
             position_after = "LONG"
+            # [NEW] SAVE STATE
+            save_state("LONG", qty, price, now)
 
         elif action == "SELL":
             if self.current_position == "LONG" and self.entry_price is not None:
                 pnl = (price - float(self.entry_price)) * qty
-            
             if self.entry_time is not None:
                 duration = (now - self.entry_time).total_seconds()
 
@@ -410,6 +421,8 @@ class StrategyRunner:
             self.entry_price = None
             self.entry_time = None
             position_after = "NONE"
+            # [NEW] CLEAR STATE
+            save_state("NONE", 0, 0.0, None)
 
         row = TradeRow(
             timestamp=now.replace(tzinfo=None), symbol=SYMBOL, action=action, price=price, quantity=qty,
@@ -422,16 +435,24 @@ class StrategyRunner:
         
         self._flush_trade_log_buffer()
         self._logged_order_ids[oid] = True
-        log_status(f"Logged fill: {action} x{qty} @ {price:.4f}, pnl={pnl:.2f}, pos={position_after}")
+        
+        msg = f"✅ <b>[{APP_NAME}]</b> FILL: {action} x{qty} @ {price:.4f} (PnL={pnl:.2f})"
+        log_status(msg)
+        send_alert(msg, APP_NAME)
 
     # ─────────────────────────────
     # MARKET DATA TICK HANDLER
     # ─────────────────────────────
     def _on_tick(self, _=None) -> None:
-        if self._stop_requested: return
-        if self._ticker is None: return
+        if self._stop_requested or self._ticker is None: return
+        
+        # SUSTAINABILITY: Tick Throttling
+        now = self._now()
+        if self.last_tick_check and (now - self.last_tick_check).total_seconds() < self.tick_throttle_sec:
+            return 
+        self.last_tick_check = now
 
-        # FIX: Handle NaN in Forex
+        # Handle NaN in Forex
         price = 0.0
         if self._ticker.last and not math.isnan(self._ticker.last):
             price = self._ticker.last
@@ -465,52 +486,70 @@ class StrategyRunner:
         self._write_heartbeat(status="order_submitted", last_price=price)
 
     # ─────────────────────────────
-    # MAIN LOOP
+    # MAIN LOOP (AUTO-RECONNECT)
     # ─────────────────────────────
     def run(self) -> None:
         global CLIENT_ID
-        while True:
+        
+        send_alert(f"🚀 <b>[{APP_NAME}]</b> Started.\nTarget: {ENTRY_MONTH}/{ENTRY_DAY} -> {EXIT_MONTH}/{EXIT_DAY}", APP_NAME)
+        
+        while not self._stop_requested:
             try:
-                log_status(f"Connecting to IBKR at {HOST}:{PORT} (clientId={CLIENT_ID})")
-                self.ib.connect(HOST, PORT, clientId=CLIENT_ID, readonly=False)
-                self.ib.qualifyContracts(self.contract)
-                log_status(f"Connected. Qualified contract: {self.contract}")
-                break
+                # 1. CONNECT
+                if not self.ib.isConnected():
+                    log_status(f"Connecting to {HOST}:{PORT} (ID: {CLIENT_ID})...")
+                    try:
+                        self.ib.connect(HOST, PORT, clientId=CLIENT_ID, readonly=False)
+                        self.ib.qualifyContracts(self.contract)
+                        log_status(f"✅ Connected. Contract: {self.contract}")
+                        send_alert(f"✅ <b>[{APP_NAME}]</b> Connected", APP_NAME)
+                    except Exception as e:
+                        if "already in use" in str(e).lower():
+                            CLIENT_ID = bump_client_id(APP_NAME, "strategy")
+                            log_status(f"⚠️ Bumped Client ID to {CLIENT_ID}")
+                        else:
+                            log_status(f"❌ Connection failed: {e}")
+                        time.sleep(10)
+                        continue
+
+                # 2. SETUP & SUBSCRIBE
+                self._ticker = self.ib.reqMktData(self.contract, "", False, False)
+                self._ticker.updateEvent += self._on_tick
+                log_status("✅ Data Subscribed. Monitoring...")
+                self._write_heartbeat("running")
+
+                # 3. MONITOR LOOP
+                while self.ib.isConnected():
+                    if self._stop_requested: break
+                    self.ib.waitOnUpdate(timeout=1.0)
+                    self._write_heartbeat("running")
+
             except Exception as e:
-                msg = str(e).lower()
-                if "client id already in use" in msg:
-                    new_id = bump_client_id(name=APP_NAME, role="strategy")
-                    CLIENT_ID = new_id
-                    time.sleep(2)
-                    continue
-                else:
-                    log_status(f"Fatal error: {e}")
-                    return
+                err_msg = f"⚠️ <b>[{APP_NAME}]</b> CRITICAL DISCONNECT!\nError: {str(e)}"
+                log_status(err_msg)
+                send_alert(err_msg, APP_NAME)
+                self._write_heartbeat("disconnected")
 
-        # CHECK 1: Restore from Broker (Priority)
-        self._sync_initial_position()
+            finally:
+                if self.ib.isConnected():
+                    self.ib.disconnect()
+                
+                if not self._stop_requested:
+                    log_status("🔄 Reconnecting in 10s...")
+                    time.sleep(10)
 
-        self._ticker = self.ib.reqMktData(self.contract, "", False, False)
-        self._ticker.updateEvent += self._on_tick
-        log_status("Subscribed to live market data.")
-        log_status(f"Strategy Active. Current Position State: {self.current_position}")
-
-        try:
-            while not self._stop_requested and self.ib.isConnected():
-                self.ib.waitOnUpdate(timeout=0.5)
-        except KeyboardInterrupt:
-            log_status("KeyboardInterrupt. Stopping.")
-        except Exception as e:
-            log_status(f"Exception: {e}")
-        finally:
-            if self.ib.isConnected(): self.ib.disconnect()
+        log_status("🛑 Bot Stopped.")
+        send_alert(f"🛑 <b>[{APP_NAME}]</b> Bot Stopped.", APP_NAME)
 
     def stop(self) -> None:
         self._stop_requested = True
 
 def main() -> None:
     runner = StrategyRunner()
-    runner.run()
+    try:
+        runner.run()
+    except KeyboardInterrupt:
+        runner.stop()
 
 if __name__ == "__main__":
     main()
