@@ -181,9 +181,14 @@ def update_weather_report():
 # 4. THE SCHEDULE LOOP
 # ==========================================
 if __name__ == "__main__":
-    print(f"📡 Weather Station Active. Scheduled for {RUN_TIME} daily.")
-    update_weather_report() # Run once immediately
-    schedule.every().day.at(RUN_TIME).do(update_weather_report)
+    print(f"📡 Weather Station Active. Checking every 60 minutes.")
+    
+    # 1. Run immediately on startup so we don't wait an hour for the first data
+    update_weather_report() 
+    
+    # 2. Schedule it to run every 60 minutes thereafter
+    schedule.every(60).minutes.do(update_weather_report) 
+    
     while True:
         schedule.run_pending()
         time.sleep(60)
