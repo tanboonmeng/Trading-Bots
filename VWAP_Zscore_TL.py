@@ -1,12 +1,5 @@
 """
-VWAP Z-score Trend Long Strategy (Regime-Aware) - PERSISTENT STATE VERSION
-
-Features:
-- Multi-symbol VWAP Z-score trend following with per-symbol parameters
-- Integrated regime filter from market_weather.json
-- RESTART SAFE: Saves position state to JSON to prevent pyramiding after restarts
-- POSITION SCOPE: Strictly Internal (ignores other bots on the same account)
-- IBKR-confirmed fills logging
+VWAP Z-score Trend Long Strategy (Regime-Aware) - PERSISTENT & AUTO-RECONNECT
 """
 
 import os
@@ -32,6 +25,8 @@ if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
 from utils.client_id_manager import get_or_allocate_client_id, bump_client_id
+# [NEW] Import the shared Telegram Alert function
+from utils.telegram_alert import send_alert
 
 # ────────────────────────────────────────────────────────────────
 # CONFIG
@@ -116,7 +111,7 @@ class SymbolState:
 # UTILITIES
 # ────────────────────────────────────────────────────────────────
 def log_status(msg: str) -> None:
-    ts = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    ts = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}][{APP_NAME}] {msg}"
     print(line)
     try:
@@ -194,7 +189,7 @@ class VWAPZscoreRunner:
             sym = cfg["symbol"]
             self.symbols[sym] = SymbolState(contract=Stock(sym, "SMART", "USD"))
             
-            # [NEW] Restore Persistence Logic
+            # Restore Persistence Logic
             pos_key = f"{sym}:POS"
             if pos_key in self.state:
                 saved = self.state[pos_key]
@@ -212,7 +207,7 @@ class VWAPZscoreRunner:
                     log_status(f"♻️ Restored {sym}: LONG {qty} shares @ {self.symbols[sym].entry_price}")
 
     def _now(self):
-        return dt.datetime.utcnow().replace(tzinfo=None)
+        return dt.datetime.now()
         
     def _on_account_summary(self, val):
         if val.tag == "TotalCashBalance" and val.currency == "BASE":
@@ -274,7 +269,7 @@ class VWAPZscoreRunner:
         save_state(self.state)
 
     def _save_symbol_state(self, symbol: str):
-        """[NEW] Saves the actual position details (Qty, Price) to JSON."""
+        """Saves the actual position details (Qty, Price) to JSON."""
         state = self.symbols[symbol]
         key = f"{symbol}:POS"
         
@@ -341,7 +336,7 @@ class VWAPZscoreRunner:
     def _write_heartbeat(self, status="running"):
         pos = {s: st.quantity for s, st in self.symbols.items() if st.quantity > 0}
         data = {
-            "app_name": APP_NAME, 
+            "app_name": APP_NAME,
             "status": status,
             "last_update": self._now().isoformat(),
             "positions": pos, 
@@ -408,7 +403,9 @@ class VWAPZscoreRunner:
         trade = self.ib.placeOrder(state.contract, order)
         oid = trade.order.orderId
         
-        log_status(f"[{symbol}] 🚀 {action} x{qty} @ ~{price:.2f} (oid={oid}) | Mode: {CAPITAL_MODE}")
+        msg = f"[{symbol}] 🚀 {action} x{qty} @ ~{price:.2f} (oid={oid}) | Mode: {CAPITAL_MODE}"
+        log_status(msg)
+        send_alert(msg, APP_NAME) # [ALERT] Order Placed
         
         state.pending_order = True
         trade.updateEvent += lambda t=trade, s=symbol: self._on_trade_update(t, s)
@@ -439,14 +436,14 @@ class VWAPZscoreRunner:
         duration = 0.0
         pos = "NONE"
         
-        # [UPDATED] Update State & Save Persistence
+        # Update State & Save Persistence
         if action == "BUY":
             state.position = "LONG"
             state.quantity = qty
             state.entry_price = price
             state.entry_time = now
             pos = "LONG"
-            self._save_symbol_state(symbol) # <--- SAVE PERSISTENCE
+            self._save_symbol_state(symbol) 
 
         elif action == "SELL":
             if state.entry_price:
@@ -458,7 +455,7 @@ class VWAPZscoreRunner:
             state.entry_price = None
             state.entry_time = None
             pos = "NONE"
-            self._save_symbol_state(symbol) # <--- SAVE PERSISTENCE
+            self._save_symbol_state(symbol) 
         else:
             return
         
@@ -471,7 +468,9 @@ class VWAPZscoreRunner:
         self._flush_trade_log()
         self._logged_orders.add(oid)
         
-        log_status(f"[{symbol}] ✅ FILL: {action} x{qty} @ {price:.2f}, pnl=${pnl:.2f}, pos={pos}")
+        msg = f"[{symbol}] ✅ FILL: {action} x{qty} @ {price:.2f}, pnl=${pnl:.2f}, pos={pos}"
+        log_status(msg)
+        send_alert(msg, APP_NAME) # [ALERT] Fill confirmed
         
         if action == "BUY":
             self._record_action_dedupe(symbol, "BUY")
@@ -486,8 +485,6 @@ class VWAPZscoreRunner:
         if not result: return
         
         _, z, vwap = result
-        
-        # log_status(f"[{symbol}] price={price:.2f}, vwap={vwap:.2f}, z={z:.2f}, pos={self.symbols[symbol].quantity}")
         
         action = self.compute_signal(symbol, price, z)
         if not action: return
@@ -515,70 +512,100 @@ class VWAPZscoreRunner:
         else:
             log_status("🔓 DISABLED")
         log_status("=" * 60)
-        
-        while True:
+
+        # Alert on Startup
+        send_alert("🚀 Started. Waiting for IBKR connection...", APP_NAME)
+
+        # [OUTER LOOP] Keeps the bot alive forever
+        while not self._stop:
             try:
-                log_status(f"Connecting to {HOST}:{PORT} (client={CLIENT_ID})")
-                self.ib.connect(HOST, PORT, clientId=CLIENT_ID, readonly=False)
-                log_status("✅ Connected")
-                break
-            except Exception as e:
-                if "already in use" in str(e).lower():
-                    CLIENT_ID = bump_client_id(APP_NAME, "strategy")
-                    log_status(f"Client ID bumped to {CLIENT_ID}")
-                    time.sleep(2)
-                else:
-                    log_status(f"❌ Fatal: {e}")
-                    return
-        
-        self.ib.reqAccountSummary()
-        
-        for sym, state in self.symbols.items():
-            self.ib.qualifyContracts(state.contract)
-            
-        for sym, state in self.symbols.items():
-            try:
-                bars = self.ib.reqHistoricalData(state.contract, "", "365 D", "1 day", "TRADES", 1, 1, True)
-                for bar in bars:
-                    state.bars.append((bar.date, float(bar.close), int(bar.volume)))
-                log_status(f"✅ [{sym}] Loaded {len(state.bars)} bars")
-                self._schedule_next_eval(sym, True)
-            except Exception as e:
-                log_status(f"⚠️ [{sym}] Historical data failed: {e}")
-            
-            try:
-                state.ticker = self.ib.reqMktData(state.contract, "", False, False)
-                state.ticker.updateEvent += lambda t=state.ticker, s=sym: self._on_tick(t, s)
-                log_status(f"✅ [{sym}] Live data subscribed")
-            except Exception as e:
-                log_status(f"⚠️ [{sym}] Live data failed: {e}")
-            
-            time.sleep(0.2)
-        
-        log_status("🚦 Monitoring live signals...")
-        self._write_heartbeat("running")
-        
-        try:
-            while not self._stop and self.ib.isConnected():
-                self.ib.waitOnUpdate(timeout=1.0)
+                # --- 1. CONNECT PHASE ---
+                if not self.ib.isConnected():
+                    log_status(f"Connecting to {HOST}:{PORT} (client={CLIENT_ID})")
+                    try:
+                        self.ib.connect(HOST, PORT, clientId=CLIENT_ID, readonly=False)
+                        log_status("✅ Connected")
+                        
+                        # [ALERT] Connected
+                        send_alert(f"✅ Connected to IBKR (Client {CLIENT_ID})", APP_NAME)
+                        
+                    except Exception as e:
+                        if "already in use" in str(e).lower():
+                            CLIENT_ID = bump_client_id(APP_NAME, "strategy")
+                            log_status(f"⚠️ Client ID conflict. Bumped to {CLIENT_ID}")
+                        else:
+                            log_status(f"❌ Connection failed: {e}")
+                        
+                        log_status("⏳ Retrying in 10 seconds...")
+                        time.sleep(10)
+                        continue 
+
+                # --- 2. SETUP/SUBSCRIBE PHASE ---
+                self.ib.reqAccountSummary()
+                
+                for sym, state in self.symbols.items():
+                    self.ib.qualifyContracts(state.contract)
+                    
+                    # Backfill History if empty
+                    if len(state.bars) == 0:
+                        try:
+                            bars = self.ib.reqHistoricalData(
+                                state.contract, "", "365 D", "1 day", "TRADES", 1, 1, True
+                            )
+                            for bar in bars:
+                                state.bars.append((bar.date, float(bar.close), int(bar.volume)))
+                            log_status(f"✅ [{sym}] Loaded {len(state.bars)} bars")
+                        except Exception as e:
+                            log_status(f"⚠️ [{sym}] Historical data failed: {e}")
+                    
+                    # Subscribe Live Data
+                    try:
+                        if state.ticker: self.ib.cancelMktData(state.contract)
+                        state.ticker = self.ib.reqMktData(state.contract, "", False, False)
+                        state.ticker.updateEvent += lambda t=state.ticker, s=sym: self._on_tick(t, s)
+                        log_status(f"✅ [{sym}] Live data subscribed")
+                    except Exception as e:
+                        log_status(f"⚠️ [{sym}] Live data failed: {e}")
+                        
+                    self._schedule_next_eval(sym, True)
+                    time.sleep(0.2)
+
+                log_status("🚦 Monitoring live signals...")
                 self._write_heartbeat("running")
 
-        except KeyboardInterrupt:
-            log_status("Stopping...")
-        except Exception as e:
-            log_status(f"Error: {e}")
-        finally:
-            self._write_heartbeat("stopped")
-            if self.ib.isConnected():
-                self.ib.disconnect()
-            log_status("Stopped.")
+                # --- 3. MONITOR LOOP ---
+                while self.ib.isConnected():
+                    if self._stop: break
+                    self.ib.waitOnUpdate(timeout=2.0)
+                    self._write_heartbeat("running")
+
+            except Exception as e:
+                # [ALERT] CRITICAL DISCONNECT
+                err_msg = f"⚠️ CRITICAL DISCONNECT!\nError: {str(e)}"
+                log_status(err_msg)
+                send_alert(err_msg, APP_NAME)
+                
+                self._write_heartbeat("disconnected")
+            
+            finally:
+                if self.ib.isConnected(): self.ib.disconnect()
+                
+                if not self._stop:
+                    log_status("🔄 Attempting Reconnect in 10s...")
+                    time.sleep(10)
+        
+        log_status("🛑 Bot explicitly stopped.")
+        send_alert("🛑 Bot stopped manually.", APP_NAME)
 
 # ────────────────────────────────────────────────────────────────
 # ENTRYPOINT
 # ────────────────────────────────────────────────────────────────
 def main():
     runner = VWAPZscoreRunner()
-    runner.run()
+    try:
+        runner.run()
+    except KeyboardInterrupt:
+        pass
 
 if __name__ == "__main__":
     main()
