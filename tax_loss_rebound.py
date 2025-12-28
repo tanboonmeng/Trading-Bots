@@ -1,24 +1,10 @@
 """
 Tax Loss Rebound - BASKET RUNNER (Queue-Based Logger)
-Adapted from IBKR-Confirmed Strategy Runner Template
-
-Strategy: 
-1. Hibernate until Dec 20th.
-2. Scan for 'Big Losers' (-20% YTD) using IBKR Historical Data.
-3. Buy Top 5 candidates.
-4. Hold until Jan 15th, then Sell.
-
-Features:
-- Source: Uses IBKR for both historical scan and live trading.
-- Dynamic Capital: Targets 'TotalCashBalance' (BASE).
-- RESTART SAFE: Replays local trade_log.csv to remember positions.
-- [NEW] QUEUE LOGGER: Uses a background thread to handle CSV I/O.
-    - Prevents "Missing Timestamp" bugs.
-    - Removes all file locking delays from the trading path.
-    - Guarantees sequential file writing.
-- RISK SAFE: Enforces hard dollar cap per trade.
-- STABILITY: Auto-reconnects on socket disconnects.
-- ZOMBIE SAFE: Resets internal state if orders are cancelled by IBKR.
+Revised Features:
+- Auto-Reconnection (Survives TWS Restarts)
+- Telegram Alerts (Entries, Exits, Disconnects, Scan Results)
+- ISOLATED STATE: Uses JSON to remember the specific basket of stocks selected.
+- QUEUE LOGGER: Thread-safe CSV writing for high performance.
 """
 
 import os
@@ -26,9 +12,8 @@ import sys
 import json
 import time
 import threading
-import queue  # [NEW] For thread-safe logging
+import queue
 import math
-import asyncio
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List
 
@@ -46,11 +31,9 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
-try:
-    from utils.client_id_manager import get_or_allocate_client_id, bump_client_id
-except ImportError:
-    def get_or_allocate_client_id(name, role, preferred=None): return 999
-    def bump_client_id(name, role): return 1000
+from utils.client_id_manager import get_or_allocate_client_id, bump_client_id
+# [NEW] Telegram Import
+from utils.telegram_alert import send_alert
 
 # ─────────────────────────────────────────────────────────────
 # CONFIGURATION
@@ -59,21 +42,21 @@ APP_NAME = "Tax_Loss_Rebound"
 
 # Connection
 HOST = "127.0.0.1"
-PORT = 7497         # 7497=Paper, 7496=Live, 4002=Gateway
-ACCOUNT_ID = "DU3188670"     # Your specific account
+PORT = 7497         
+ACCOUNT_ID = "DU3188670"
 
 # Strategy Dates
 ENTRY_START_DATE = "2025-12-20"
 EXIT_START_DATE = "2026-01-15"
 
 # Capital & Risk
-PERCENTAGE_PER_STOCK = 0.02      # 0.4% of Cash per stock
+PERCENTAGE_PER_STOCK = 0.02      
 MAX_CAPITAL_PER_TRADE_USD = 2000.0 
 MIN_QTY = 1
 LOSERS_THRESHOLD = -0.20          
 TOP_N_TARGETS = 5
 
-# Logging
+# Logs
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_ROOT = os.path.join(BASE_DIR, "logs", APP_NAME)
 os.makedirs(LOG_ROOT, exist_ok=True)
@@ -81,6 +64,8 @@ os.makedirs(LOG_ROOT, exist_ok=True)
 TRADE_LOG_PATH = os.path.join(LOG_ROOT, "trade_log.csv")
 HEARTBEAT_PATH = os.path.join(LOG_ROOT, "heartbeat.json")
 STATUS_LOG_PATH = os.path.join(LOG_ROOT, "status.log")
+# [NEW] Basket State File
+STATE_FILE = os.path.join(LOG_ROOT, "state_Tax_Loss_Basket.json")
 
 CLIENT_ID = get_or_allocate_client_id(name=APP_NAME, role="strategy", preferred=None)
 
@@ -125,14 +110,50 @@ def log_status(msg: str) -> None:
     except Exception:
         pass
 
+# ─────────────────────────────────────────────────────────────
+# STATE MANAGEMENT (JSON)
+# ─────────────────────────────────────────────────────────────
+def load_basket_state() -> Dict[str, Any]:
+    """Loads the specific basket of stocks and their positions."""
+    if not os.path.exists(STATE_FILE):
+        return {}
+    try:
+        with open(STATE_FILE, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        log_status(f"⚠️ Failed to load basket state: {e}")
+        return {}
+
+def save_basket_state(positions: Dict[str, PositionState]):
+    """Saves the entire basket state to disk."""
+    data = {}
+    for sym, state in positions.items():
+        data[sym] = {
+            "status": state.status,
+            "qty": state.qty,
+            "entry_price": state.entry_price,
+            "entry_time": state.entry_time.isoformat() if state.entry_time else None
+        }
+    
+    wrapper = {
+        "last_updated": dt.datetime.now().isoformat(),
+        "positions": data
+    }
+    
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(wrapper, f, indent=2)
+    except Exception as e:
+        log_status(f"⚠️ Failed to save basket state: {e}")
+
 
 # ─────────────────────────────────────────────────────────────
-# SCANNER LOGIC (IBKR VERSION)
+# SCANNER LOGIC
 # ─────────────────────────────────────────────────────────────
 def scan_for_basket(ib_conn: IB, top_n: int) -> List[str]:
     log_status(f"Scanning for Top {top_n} candidates using IBKR Data...")
     
-    # 1. Load Tickers
+    # Load Tickers
     csv_filename = os.path.join(BASE_DIR, "russell2000_tickers.csv")
     ticker_list = ["AMC", "GME", "PLUG", "DKNG", "MSTR", "COIN", "CVNA", "UPST", "AFRM", "SOFI", "NVDA", "TSLA"]
     
@@ -145,20 +166,17 @@ def scan_for_basket(ib_conn: IB, top_n: int) -> List[str]:
 
     basket = []
     
-    for t in ticker_list:
+    # Simple Progress tracking
+    total = len(ticker_list)
+    for i, t in enumerate(ticker_list):
+        if i % 50 == 0: log_status(f"Scanning... {i}/{total}")
+        
         contract = Stock(t, "SMART", "USD")
         try:
             bars = ib_conn.reqHistoricalData(
-                contract,
-                endDateTime='',
-                durationStr='1 Y',
-                barSizeSetting='1 day',
-                whatToShow='TRADES',
-                useRTH=True,
-                formatDate=1,
-                keepUpToDate=False
+                contract, endDateTime='', durationStr='1 Y', barSizeSetting='1 day',
+                whatToShow='TRADES', useRTH=True, formatDate=1, keepUpToDate=False
             )
-
             if not bars: continue
 
             start_price = bars[0].close
@@ -171,9 +189,8 @@ def scan_for_basket(ib_conn: IB, top_n: int) -> List[str]:
                 log_status(f"Found Candidate: {t} ({perf:.2%})")
                 basket.append(t)
             
-            if len(basket) >= top_n:
-                break
-            time.sleep(0.1)
+            if len(basket) >= top_n: break
+            time.sleep(0.1) # Throttle
         except Exception:
             pass
 
@@ -181,7 +198,9 @@ def scan_for_basket(ib_conn: IB, top_n: int) -> List[str]:
         log_status("No tickers met the loser criteria.")
         return []
 
-    log_status(f"🎯 Basket Selected: {basket}")
+    msg = f"🎯 Basket Selected: {basket}"
+    log_status(msg)
+    send_alert(msg, APP_NAME)
     return basket
 
 
@@ -205,8 +224,7 @@ class StrategyRunner:
         self.entry_start = dt.datetime.strptime(ENTRY_START_DATE, "%Y-%m-%d").replace(tzinfo=dt.timezone.utc)
         self.exit_start = dt.datetime.strptime(EXIT_START_DATE, "%Y-%m-%d").replace(tzinfo=dt.timezone.utc)
 
-        # [NEW] QUEUE LOGGING SYSTEM
-        # We no longer use a simple list buffer. We use a thread-safe Queue.
+        # LOGGING SYSTEM (Queue)
         self.log_queue = queue.Queue()
         self._stop_requested = False
         self._logged_order_ids: Dict[int, bool] = {}
@@ -214,6 +232,9 @@ class StrategyRunner:
         # Start the background logger thread
         self.logger_thread = threading.Thread(target=self._logger_worker, daemon=True)
         self.logger_thread.start()
+        
+        # Restore Basket State immediately
+        self._restore_state()
 
     # ─────────────────────────────
     # UTILS
@@ -221,146 +242,95 @@ class StrategyRunner:
     def _now(self) -> dt.datetime:
         return dt.datetime.now(dt.timezone.utc)
 
-    # ─────────────────────────────
-    # [NEW] DEDICATED LOGGER WORKER
-    # ─────────────────────────────
     def _logger_worker(self):
-        """
-        Runs in a separate thread.
-        Consumes trade records from the queue and writes them to CSV sequentially.
-        This guarantees that no two file operations ever overlap.
-        """
+        """Background thread for non-blocking CSV writing."""
         while not self._stop_requested:
             try:
-                # Block for 1 second waiting for data, then loop to check stop_request
                 record = self.log_queue.get(timeout=1.0)
             except queue.Empty:
                 continue
 
             try:
-                # 1. Prepare New Data DataFrame
-                # We enforce string formatting immediately to prevent NaT issues
                 row_dict = {
                     "timestamp": record.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
-                    "symbol": record.symbol,
-                    "action": record.action,
-                    "price": record.price,
-                    "quantity": record.quantity,
-                    "pnl": record.pnl,
-                    "duration": record.duration,
-                    "position": record.position,
-                    "status": record.status,
+                    "symbol": record.symbol, "action": record.action,
+                    "price": record.price, "quantity": record.quantity,
+                    "pnl": record.pnl, "duration": record.duration,
+                    "position": record.position, "status": record.status,
                     "ib_order_id": record.ib_order_id,
                     "extra": json.dumps(record.extra) if record.extra else None,
                 }
                 df_new = pd.DataFrame([row_dict])
 
-                # 2. Read Existing CSV
                 if os.path.exists(TRADE_LOG_PATH):
-                    try:
-                        df_old = pd.read_csv(TRADE_LOG_PATH)
-                    except Exception:
-                        df_old = pd.DataFrame()
+                    try: df_old = pd.read_csv(TRADE_LOG_PATH)
+                    except: df_old = pd.DataFrame()
                     df = pd.concat([df_old, df_new], ignore_index=True)
                 else:
                     df = df_new
 
-                # 3. Deduplicate (Dedup Key Logic)
                 if not df.empty:
-                    # Create temporary key for dedup
                     df["dedup_key"] = (
-                        df["timestamp"].astype(str)
-                        + "|" + df["symbol"].astype(str)
-                        + "|" + df["action"].astype(str)
-                        + "|" + df["ib_order_id"].astype(str)
+                        df["timestamp"].astype(str) + "|" + df["symbol"].astype(str)
+                        + "|" + df["action"].astype(str) + "|" + df["ib_order_id"].astype(str)
                     )
                     df = df.drop_duplicates(subset=["dedup_key"]).drop(columns=["dedup_key"])
 
-                # 4. Sort (Convert to datetime for sort, then back to string isn't strictly needed if ISO, 
-                #    but good for safety. We just store as is to keep it simple and robust.)
-                #    If you need strict time sorting, we do a temp conversion:
-                if "timestamp" in df.columns:
-                    temp_time = pd.to_datetime(df["timestamp"], errors="coerce")
-                    df = df.iloc[temp_time.argsort()]
-
-                # 5. Save
                 df.to_csv(TRADE_LOG_PATH, index=False)
-                
-                # Signal queue that task is done
                 self.log_queue.task_done()
-                
             except Exception as e:
                 print(f"CRITICAL LOGGER ERROR: {e}")
 
     def _write_heartbeat(self, status: str = "running") -> None:
+        pos_summary = {sym: s.qty for sym, s in self.positions.items() if s.qty > 0}
         data = {
             "app_name": APP_NAME,
             "status": status,
-            "last_update": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "last_update": self._now().isoformat(),
             "cash_base": self.account_cash,
-            "active_symbols": self.symbols
+            "active_positions": pos_summary
         }
         try:
             with open(HEARTBEAT_PATH, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
         except Exception: pass
 
-    def _reconstruct_state_from_log(self):
-        """Restores position state by replaying the local trade_log.csv."""
-        if not os.path.exists(TRADE_LOG_PATH):
+    # ─────────────────────────────
+    # STATE MANAGEMENT
+    # ─────────────────────────────
+    def _restore_state(self):
+        saved_data = load_basket_state()
+        if not saved_data or "positions" not in saved_data:
             return
 
-        try:
-            df = pd.read_csv(TRADE_LOG_PATH)
-            if df.empty: return
+        positions_data = saved_data["positions"]
+        self.symbols = list(positions_data.keys())
+        
+        log_status("♻️ Restoring Basket State...")
+        for sym, p_data in positions_data.items():
+            state = PositionState(sym)
+            state.status = p_data.get("status", "NONE")
+            state.qty = int(p_data.get("qty", 0))
+            state.entry_price = p_data.get("entry_price")
             
-            # Filter for symbols we are currently tracking
-            current_basket = set(self.positions.keys())
-            df = df[df['symbol'].isin(current_basket)].copy()
-
-            if df.empty: return
-
-            if "timestamp" in df.columns:
-                df['timestamp'] = pd.to_datetime(df['timestamp'])
-                df = df.sort_values('timestamp')
-
-            log_status("🔄 Replaying Trade Log to restore state...")
-
-            for _, row in df.iterrows():
-                sym = str(row['symbol'])
-                action = str(row['action']).upper()
-                
-                state = self.positions[sym]
-                
-                if action == "BUY":
-                    state.status = "LONG"
-                    state.qty = int(row['quantity'])
-                    state.entry_price = float(row['price'])
-                    state.entry_time = row['timestamp'].to_pydatetime() if pd.notnull(row['timestamp']) else None
-                    
-                elif action == "SELL":
-                    state.status = "NONE"
-                    state.qty = 0
-                    state.entry_price = None
-                    state.entry_time = None
+            t_str = p_data.get("entry_time")
+            if t_str:
+                try: state.entry_time = dt.datetime.fromisoformat(t_str)
+                except: pass
             
-            for sym, state in self.positions.items():
-                if state.status == "LONG":
-                    log_status(f"   -> Restored {sym}: LONG {state.qty} shares")
-
-        except Exception as e:
-            log_status(f"⚠️ Error reading trade log: {e}")
+            self.positions[sym] = state
+            self.contracts[sym] = Stock(sym, "SMART", "USD")
+            
+            if state.status == "LONG":
+                log_status(f"   -> {sym}: LONG {state.qty} shares")
 
     # ─────────────────────────────
-    # CAPITAL LOGIC
+    # TRADING LOGIC
     # ─────────────────────────────
     def on_account_summary(self, val: Any):
         if val.tag == "TotalCashBalance" and val.currency == "BASE":
             try:
-                new_cash = float(val.value)
-                if self.account_cash == 0 or abs(new_cash - self.account_cash) > 50.0: 
-                    self.account_cash = new_cash
-                    log_status(f"💰 Account Cash Updated: ${self.account_cash:,.2f} (BASE)")
+                self.account_cash = float(val.value)
             except: pass
 
     def _qty_for_symbol(self, price: float) -> int:
@@ -371,9 +341,6 @@ class StrategyRunner:
         qty = int(alloc_amt // price)
         return qty if qty >= MIN_QTY else 0
 
-    # ─────────────────────────────
-    # TRADING LOGIC
-    # ─────────────────────────────
     def check_signal(self, symbol: str) -> Optional[str]:
         state = self.positions.get(symbol)
         if not state: return None
@@ -386,6 +353,7 @@ class StrategyRunner:
             return None 
 
         if state.status == "NONE":
+            # Only buy if we are in the entry window (Same Year as start)
             if (now >= self.entry_start) and (now.year == self.entry_start.year):
                return "BUY"
         return None
@@ -413,15 +381,15 @@ class StrategyRunner:
         trade = self.ib.placeOrder(contract, order)
          
         # Optimistic Update
-        if action == "BUY":
-            state.status = "LONG"
-        elif action == "SELL":
-            state.status = "NONE"
+        if action == "BUY": state.status = "LONG"
+        elif action == "SELL": state.status = "NONE"
 
         trade.fillEvent += self._on_trade_update
         trade.statusEvent += self._on_order_status
         
-        log_status(f"[{symbol}] Placed {action} {qty} @ ~{price:.2f} (Id: {trade.order.orderId})")
+        msg = f"🚀 <b>[{APP_NAME}]</b> {action} {qty} {symbol} @ ~{price:.2f}"
+        log_status(msg)
+        send_alert(msg, APP_NAME)
 
     # ─────────────────────────────
     # EVENTS
@@ -429,14 +397,8 @@ class StrategyRunner:
     def _on_tick(self, ticker: Ticker):
         if self._stop_requested: return
         symbol = ticker.contract.symbol
-        price = ticker.last if ticker.last and not pd.isna(ticker.last) else None
-        
-        if not price or price <= 0:
-            mp = ticker.marketPrice()
-            if mp and not pd.isna(mp): price = mp
-        if (not price or pd.isna(price) or price <= 0) and ticker.close:
-            price = ticker.close
-        if not price or pd.isna(price) or price <= 0: return
+        price = ticker.last or ticker.close
+        if not price or price <= 0: return
 
         action = self.check_signal(symbol)
         if action:
@@ -453,9 +415,9 @@ class StrategyRunner:
                 state.status = "NONE"
                 state.qty = 0
                 state.entry_price = None
+                save_basket_state(self.positions)
 
     def _on_trade_update(self, trade: Trade, *args):
-        # 1. Validation
         fill = args[0] if args else None
         if fill:
             fill_price = fill.execution.price
@@ -468,14 +430,11 @@ class StrategyRunner:
         if filled_qty <= 0 or fill_price <= 0: return
 
         oid = trade.order.orderId
-        
-        # 2. Memory Deduplication
         if self._logged_order_ids.get(oid): return
         self._logged_order_ids[oid] = True
         
         symbol = trade.contract.symbol
-        action = trade.order.action
-        
+        action = trade.order.action.upper()
         state = self.positions.get(symbol)
         if not state: return 
 
@@ -487,6 +446,7 @@ class StrategyRunner:
             state.qty = int(filled_qty)
             state.entry_price = float(fill_price)
             state.entry_time = now
+            state.status = "LONG"
         elif action == "SELL":
             if state.entry_price:
                 pnl = (fill_price - state.entry_price) * filled_qty
@@ -494,37 +454,41 @@ class StrategyRunner:
                 duration = (now - state.entry_time).total_seconds()
             state.qty = 0
             state.entry_price = None
+            state.status = "NONE"
 
-        log_ts = now.replace(tzinfo=None)
-        status_str = trade.orderStatus.status
-        if status_str not in ('Filled', 'PartiallyFilled'):
-            status_str = 'Filled' 
+        # SAVE BASKET STATE
+        save_basket_state(self.positions)
 
-        # 3. Create Row Object
-        row = TradeRow(log_ts, symbol, action, fill_price, filled_qty, pnl, duration, state.status, status_str, oid)
-        
-        # 4. [FIX] PUSH TO QUEUE (Non-Blocking)
-        # We do NOT write to CSV here. We just push to the queue.
-        # The background thread handles the risky I/O part.
+        row = TradeRow(
+            timestamp=now.replace(tzinfo=None), symbol=symbol, action=action,
+            price=fill_price, quantity=int(filled_qty), pnl=pnl, duration=duration,
+            position=state.status, status=trade.orderStatus.status, ib_order_id=oid
+        )
         self.log_queue.put(row)
         
-        log_status(f"[{symbol}] Logged Fill: {action} {filled_qty} @ {fill_price:.2f}")
+        msg = f"✅ <b>[{APP_NAME}]</b> FILL: {symbol} {action} {filled_qty} @ {fill_price:.2f} (PnL=${pnl:.2f})"
+        log_status(msg)
+        send_alert(msg, APP_NAME)
 
     # ─────────────────────────────
     # MAIN EXECUTION
     # ─────────────────────────────
-    def _perform_scan_and_setup(self):
-        self.symbols = scan_for_basket(self.ib, TOP_N_TARGETS)
+    def _setup_basket(self):
+        # If we already have symbols from state, skip scanning
+        if self.symbols:
+            log_status(f"♻️ Using restored basket: {self.symbols}")
+        else:
+            self.symbols = scan_for_basket(self.ib, TOP_N_TARGETS)
+        
         if not self.symbols:
             log_status("Scan returned no candidates. Stopping.")
             self.stop()
             return
 
         for s in self.symbols:
-            self.positions[s] = PositionState(s)
+            if s not in self.positions:
+                self.positions[s] = PositionState(s)
             self.contracts[s] = Stock(s, "SMART", "USD")
-
-        self._reconstruct_state_from_log()
 
         log_status("Qualifying contracts...")
         for sym, contract in self.contracts.items():
@@ -540,78 +504,66 @@ class StrategyRunner:
 
     def run(self) -> None:
         global CLIENT_ID
-        while True:
-            try:
-                log_status(f"Connecting to IBKR {HOST}:{PORT} (ID: {CLIENT_ID})...")
-                self.ib.connect(HOST, PORT, clientId=CLIENT_ID)
-                break
-            except Exception as e:
-                if "client id already in use" in str(e).lower():
-                    CLIENT_ID = bump_client_id(APP_NAME, "strategy")
-                    continue
-        
-        time.sleep(5)
-        log_status("Waiting for Account Data...")
-        self.ib.accountSummaryEvent += self.on_account_summary
-        self.ib.reqAccountSummary()
-        
-        wait_start = time.time()
-        while self.account_cash <= 0:
-            self.ib.sleep(1) 
-            if time.time() - wait_start > 30:
-                self.account_cash = 10000.0
-                break
-        
-        if self.account_cash > 0:
-            log_status(f"✅ Cash Balance Confirmed: ${self.account_cash:,.2f}")
-
-        log_status(f"Date Check. Target Entry: {ENTRY_START_DATE}")
-        while not self._stop_requested:
-            now = self._now()
-            if now < self.entry_start:
-                log_status(f"Too early. Hibernating... (Current: {now.strftime('%Y-%m-%d')})")
-                self.ib.sleep(3600)
-            else:
-                log_status("✅ Entry Date Reached! Starting...")
-                break
-
-        self._perform_scan_and_setup()
+        send_alert(f"🚀 <b>[{APP_NAME}]</b> Started.", APP_NAME)
         
         while not self._stop_requested:
             try:
+                # 1. CONNECT
                 if not self.ib.isConnected():
-                    log_status("⚠️ Connection lost. Attempting reconnect...")
+                    log_status(f"Connecting to {HOST}:{PORT} (ID: {CLIENT_ID})...")
                     try:
-                        self.ib.connect(HOST, PORT, clientId=CLIENT_ID)
-                        time.sleep(5)
-                        self.ib.reqAccountSummary()
-                        for contract in self.contracts.values():
-                            self.ib.reqMktData(contract, "", False, False)
-                    except Exception:
-                        self.ib.sleep(5.0)
+                        self.ib.connect(HOST, PORT, clientId=CLIENT_ID, readonly=False)
+                        log_status("✅ Connected")
+                        send_alert(f"✅ <b>[{APP_NAME}]</b> Connected", APP_NAME)
+                    except Exception as e:
+                        if "already in use" in str(e).lower():
+                            CLIENT_ID = bump_client_id(APP_NAME, "strategy")
+                        else:
+                            log_status(f"❌ Connection failed: {e}")
+                        time.sleep(10)
                         continue
 
-                self.ib.waitOnUpdate(timeout=1.0)
+                # 2. INITIALIZATION (Once per session)
+                if not self.symbols: # If not yet setup
+                    self.ib.reqAccountSummary()
+                    self.ib.accountSummaryEvent += self.on_account_summary
+                    
+                    # Wait for Entry Date
+                    now = self._now()
+                    if now < self.entry_start:
+                        log_status(f"⏳ Waiting for Entry Date: {ENTRY_START_DATE}")
+                        self.ib.sleep(60) # Sleep and check connection
+                        continue
+                    
+                    self._setup_basket()
                 
+                # Resubscribe if we reconnected
+                for sym, contract in self.contracts.items():
+                    self.ib.reqMktData(contract, "", False, False)
+
+                # 3. MONITOR LOOP
+                while self.ib.isConnected():
+                    if self._stop_requested: break
+                    self.ib.waitOnUpdate(timeout=1.0)
+                    self._write_heartbeat("running")
+
             except Exception as e:
-                if "Socket disconnect" in str(e) or "connection" in str(e).lower():
-                    log_status(f"Socket/Connection Error: {e}")
-                    self.ib.sleep(2.0)
-                elif isinstance(e, KeyboardInterrupt):
-                    self.stop()
-                    break
-                else:
-                    log_status(f"Loop Error: {e}")
-                self.ib.sleep(1.0)
-        
-        if self.ib.isConnected(): self.ib.disconnect()
-        log_status("Runner Stopped.")
+                err_msg = f"⚠️ <b>[{APP_NAME}]</b> CRITICAL DISCONNECT!\nError: {str(e)}"
+                log_status(err_msg)
+                send_alert(err_msg, APP_NAME)
+                self._write_heartbeat("disconnected")
+
+            finally:
+                if self.ib.isConnected(): self.ib.disconnect()
+                if not self._stop_requested:
+                    log_status("🔄 Reconnecting in 10s...")
+                    time.sleep(10)
+
+        log_status("🛑 Bot Stopped.")
+        send_alert(f"🛑 <b>[{APP_NAME}]</b> Bot Stopped.", APP_NAME)
 
     def stop(self) -> None:
         self._stop_requested = True
-        # Wait for logger to finish pending items?
-        # In a real daemon, we might just let it die, but queue is safer.
-        pass
 
 if __name__ == "__main__":
     StrategyRunner().run()
