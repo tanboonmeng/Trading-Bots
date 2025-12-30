@@ -1,12 +1,12 @@
 """
-IBS (Internal Bar Strength) BASKET Strategy
+IBS (Internal Bar Strength) BASKET Strategy - MULTI-TIMEFRAME
 Live Trading Runner - AUTO-RECONNECT, TELEGRAM & BASKET STATE
 
 Features:
+- Multi-Timeframe Support: Daily or Hourly bars
 - Auto-Reconnection: Survives TWS disconnects.
 - Telegram Alerts: Notifies on Trades and Errors.
-- Basket State Persistence: Remembers positions (AAPL, MSFT, etc.) after restart.
-- Strict Adherence: Matches IBS.txt logic (updateEvent, PnL=0.0).
+- Basket State Persistence: Remembers positions after restart.
 """
 
 import os
@@ -25,9 +25,9 @@ from datetime import timezone
 
 from ib_insync import IB, Stock, MarketOrder, Trade
 
-# ────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════
 # PATH & CLIENT ID MANAGER
-# ────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
@@ -35,13 +35,41 @@ if PROJECT_ROOT not in sys.path:
 from utils.client_id_manager import get_or_allocate_client_id, bump_client_id
 from utils.telegram_alert import send_alert
 
-# ────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════
 # CONFIG
-# ────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════
 APP_NAME = "IBS"
 HOST = "127.0.0.1"
 PORT = 7497         
 ACCOUNT_ID = "DU3188670"
+
+# -------------------- TIMEFRAME CONFIGURATION --------------------
+# Options: "DAILY" or "HOURLY"
+TIMEFRAME = "HOURLY"  # <-- Change this to "HOURLY" for hourly bars
+
+# Timeframe settings mapping
+TIMEFRAME_SETTINGS = {
+    "DAILY": {
+        "bar_size": "1 day",
+        "duration": "1 Y",      # 1 year of daily data
+        "description": "Daily Bars"
+    },
+    "HOURLY": {
+        "bar_size": "1 hour",
+        "duration": "30 D",     # 30 days of hourly data (~500 bars)
+        "description": "Hourly Bars"
+    }
+}
+
+# Validate timeframe
+if TIMEFRAME not in TIMEFRAME_SETTINGS:
+    raise ValueError(f"Invalid TIMEFRAME: {TIMEFRAME}. Must be 'DAILY' or 'HOURLY'")
+
+# Set active timeframe settings
+ACTIVE_TF = TIMEFRAME_SETTINGS[TIMEFRAME]
+HIST_BAR_SIZE = ACTIVE_TF["bar_size"]
+HIST_DURATION = ACTIVE_TF["duration"]
+TF_DESCRIPTION = ACTIVE_TF["description"]
 
 # ---------------- STOCK BASKET CONFIGURATION ----------------
 IBS_STOCKS = [
@@ -81,8 +109,6 @@ USE_LOCAL_TIME = True
 
 # Historical Data
 USE_RTH = True
-HIST_DURATION = "1 Y"            
-HIST_BAR_SIZE = "1 day"
 HIST_WHAT = "TRADES"
 
 # Logs
@@ -93,15 +119,15 @@ os.makedirs(LOG_ROOT, exist_ok=True)
 TRADE_LOG_PATH = os.path.join(LOG_ROOT, "trade_log.csv")
 HEARTBEAT_PATH = os.path.join(LOG_ROOT, "heartbeat.json")
 STATUS_LOG_PATH = os.path.join(LOG_ROOT, "status.log")
-STATE_FILE = os.path.join(LOG_ROOT, "last_actions.json") # For Dedup
-POS_STATE_FILE = os.path.join(LOG_ROOT, "state_IBS_positions.json") # For Reconnect
+STATE_FILE = os.path.join(LOG_ROOT, "last_actions.json")
+POS_STATE_FILE = os.path.join(LOG_ROOT, "state_IBS_positions.json")
 
 CLIENT_ID = get_or_allocate_client_id(name=APP_NAME, role="strategy", preferred=None)
 
 
-# ────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════
 # DATA STRUCTURES
-# ────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════
 @dataclass
 class TradeRow:
     timestamp: dt.datetime
@@ -117,9 +143,9 @@ class TradeRow:
     extra: Dict[str, Any] = field(default_factory=dict)
 
 
-# ────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════
 # HELPER FUNCTIONS
-# ────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════
 def log_status(msg: str) -> None:
     if USE_LOCAL_TIME:
         ts = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -141,10 +167,10 @@ def load_weather_report():
         with open(WEATHER_FILE, "r") as f:
             return json.load(f)
     except FileNotFoundError:
-        log_status(f"⚠️  Weather file not found: {WEATHER_FILE}")
+        log_status(f"⚠️ Weather file not found: {WEATHER_FILE}")
         return None
     except Exception as e:
-        log_status(f"⚠️  Error reading weather: {e}")
+        log_status(f"⚠️ Error reading weather: {e}")
         return None
 
 def check_trading_permission(weather_data, strategy_type="mean_reversion"):
@@ -173,16 +199,15 @@ def save_state(state):
     except Exception:
         pass
 
-# [NEW] Basket State Persistence for Reconnection
 def save_basket_state(positions, quantities, entry_prices, entry_times):
     try:
-        # Convert datetimes to isoformat strings
         times_str = {k: v.isoformat() if v else None for k, v in entry_times.items()}
         data = {
             "positions": positions,
             "quantities": quantities,
             "entry_prices": entry_prices,
             "entry_times": times_str,
+            "timeframe": TIMEFRAME,
             "updated": dt.datetime.now().isoformat()
         }
         with open(POS_STATE_FILE, "w") as f:
@@ -198,9 +223,10 @@ def load_basket_state():
     except Exception:
         return None
 
-# ────────────────────────────────────────────────────────────────────
+
+# ════════════════════════════════════════════════════════════════════
 # BASKET STRATEGY RUNNER
-# ────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════
 class IBSBasketRunner:
     def __init__(self) -> None:
         self.ib = IB()
@@ -214,11 +240,12 @@ class IBSBasketRunner:
         self.entry_prices: Dict[str, Optional[float]] = {s['symbol']: None for s in IBS_STOCKS}
         self.entry_times: Dict[str, Optional[dt.datetime]] = {s['symbol']: None for s in IBS_STOCKS}
         
-        # Restore state if exists (Critical for Reconnection)
+        # Restore state if exists
         self._restore_basket_state()
 
-        # Data storage per symbol
-        self.daily_bars_map: Dict[str, deque] = {s['symbol']: deque(maxlen=400) for s in IBS_STOCKS}
+        # Data storage per symbol - increased buffer for hourly data
+        buffer_size = 500 if TIMEFRAME == "HOURLY" else 400
+        self.daily_bars_map: Dict[str, deque] = {s['symbol']: deque(maxlen=buffer_size) for s in IBS_STOCKS}
         self.bars_ready_map: Dict[str, bool] = {s['symbol']: False for s in IBS_STOCKS}
         
         self.config_map = {s['symbol']: s for s in IBS_STOCKS}
@@ -240,7 +267,7 @@ class IBSBasketRunner:
         self.is_sleeping = False
         self.next_weather_check = None
 
-        self.state = load_state() # Dedup state
+        self.state = load_state()
         
         self.last_log_time = None
         self.log_interval_sec = 60
@@ -250,6 +277,12 @@ class IBSBasketRunner:
     def _restore_basket_state(self):
         saved = load_basket_state()
         if not saved: return
+        
+        # Check if timeframe matches
+        saved_tf = saved.get("timeframe", "DAILY")
+        if saved_tf != TIMEFRAME:
+            log_status(f"⚠️ Saved state is for {saved_tf}, current is {TIMEFRAME}. Skipping restore.")
+            return
         
         log_status("♻️ Restoring Basket State...")
         try:
@@ -267,15 +300,14 @@ class IBSBasketRunner:
                     try: self.entry_times[sym] = dt.datetime.fromisoformat(et[sym])
                     except: pass
             
-            # Log restored positions
             restored = [f"{k}: {v}" for k, v in self.positions.items() if v != "NONE"]
             if restored: log_status(f"   Held Positions: {', '.join(restored)}")
         except Exception as e:
             log_status(f"⚠️ Error restoring state: {e}")
 
-    # ────────────────────────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════
     # ACCOUNT
-    # ────────────────────────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════
     def _on_account_summary(self, val):
         if val.tag == CASH_TAG and val.currency == "BASE":
             try:
@@ -286,9 +318,9 @@ class IBSBasketRunner:
             except Exception:
                 pass
 
-    # ────────────────────────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════
     # FILE IO
-    # ────────────────────────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════
     def _flush_trade_log_buffer(self) -> None:
         with self.lock:
             if not self.trade_log_buffer: return
@@ -299,6 +331,7 @@ class IBSBasketRunner:
                     "symbol": r.symbol, "action": r.action, "price": r.price,
                     "quantity": r.quantity, "pnl": r.pnl, "duration": r.duration,
                     "position": r.position, "status": r.status, "ib_order_id": r.ib_order_id,
+                    "timeframe": TIMEFRAME,
                     "extra": json.dumps(r.extra) if r.extra else None,
                 })
             df_new = pd.DataFrame(rows)
@@ -339,6 +372,7 @@ class IBSBasketRunner:
 
         data = {
             "app_name": APP_NAME,
+            "timeframe": TIMEFRAME,
             "status": status,
             "updated": self._now().isoformat(),
             "cash": self.account_cash,
@@ -350,9 +384,9 @@ class IBSBasketRunner:
                 json.dump(data, f, indent=2)
         except: pass
 
-    # ────────────────────────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════
     # WEATHER & TIME
-    # ────────────────────────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════
     def _now(self) -> dt.datetime:
         if USE_LOCAL_TIME:
             return dt.datetime.now().replace(tzinfo=None)
@@ -373,7 +407,7 @@ class IBSBasketRunner:
     def _update_weather(self):
         with self.weather_lock:
             if WEATHER_BYPASS_MODE:
-                log_status("⚠️  WEATHER BYPASS MODE ENABLED")
+                log_status("⚠️ WEATHER BYPASS MODE ENABLED")
                 self.current_weather = {
                     "market_condition": {"regime_desc": "BYPASS MODE"},
                     "strategy_commands": {"mean_reversion": "GO"}
@@ -391,7 +425,7 @@ class IBSBasketRunner:
                 perms = self.current_weather.get("strategy_commands", {})
                 mr_perm = perms.get("mean_reversion", "STOP")
                 
-                log_status(f"{'='*60}\n🌡️  WEATHER UPDATE\n   Regime: {regime}\n   MR Permission: {mr_perm}\n   Next Check: {self.next_weather_check}\n{'='*60}")
+                log_status(f"{'='*60}\n🌡️ WEATHER UPDATE\n   Regime: {regime}\n   MR Permission: {mr_perm}\n   Next Check: {self.next_weather_check}\n{'='*60}")
                 
                 if SLEEP_WHEN_BLOCKED and mr_perm == "STOP":
                     self.is_sleeping = True
@@ -400,7 +434,7 @@ class IBSBasketRunner:
                     self.is_sleeping = False
                     log_status("✅ ACTIVE MODE - Mean Reversion Allowed")
             else:
-                log_status("⚠️  Weather unavailable - BLOCKED")
+                log_status("⚠️ Weather unavailable - BLOCKED")
                 self.is_sleeping = True
 
     def _check_weather_permission(self) -> tuple:
@@ -415,9 +449,9 @@ class IBSBasketRunner:
         with self.weather_lock:
             return check_trading_permission(self.current_weather, "mean_reversion")
 
-    # ────────────────────────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════
     # TRADING LOGIC
-    # ────────────────────────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════
     def _record_action(self, symbol: str, side: str):
         key = f"{symbol}:{side}"
         self.state[key] = {"ts": self._now().isoformat()}
@@ -448,7 +482,6 @@ class IBSBasketRunner:
         
         if allocated <= 0: return 0
         qty = int(allocated // price)
-        # Matches IBS.txt: Only checks MIN_QTY, no MAX_CAPITAL check
         return max(MIN_QTY, qty) if qty >= MIN_QTY else 0
 
     def _calculate_ibs(self, symbol: str) -> Optional[float]:
@@ -461,7 +494,6 @@ class IBSBasketRunner:
 
     def _can_trade_symbol(self, symbol: str, action: str, price: float) -> bool:
         now = self._now()
-        # Matches IBS.txt: Checks < 5 seconds hardcoded (not COOLDOWN_SEC)
         if self.last_trade_time and (now - self.last_trade_time).total_seconds() < 5:
             return False
             
@@ -483,9 +515,6 @@ class IBSBasketRunner:
         self.tick_counts[symbol] += 1
         now = self._now()
         if self.last_log_time is None or (now - self.last_log_time).total_seconds() > self.log_interval_sec:
-             ibs = self._calculate_ibs(symbol)
-             # Heartbeat log (optional, uncomment if noisy)
-             # log_status(f"[{symbol}] Prc={price:.2f} IBS={ibs if ibs else 'N/A'} Pos={self.positions[symbol]}")
              self.last_log_time = now
              self._write_heartbeat()
 
@@ -495,20 +524,17 @@ class IBSBasketRunner:
         config = self.config_map[symbol]
         action = None
         
-        # SUSTAINABILITY: Logic Checks First, File I/O Last
-        
         # SELL Logic
         if self.positions[symbol] == "LONG" and ibs > config['sell_thr']:
-            log_status(f"📈 [{symbol}] SELL SIG: IBS {ibs:.3f} > {config['sell_thr']}")
+            log_status(f"📈 [{symbol}] SELL SIG: IBS {ibs:.3f} > {config['sell_thr']} ({TF_DESCRIPTION})")
             action = "SELL"
             
         # BUY Logic
         elif self.positions[symbol] == "NONE" and ibs < config['buy_thr']:
-            # SIGNAL DETECTED: Now we check weather (Lazy Check)
             allowed, _, _ = self._check_weather_permission()
             if allowed:
                 if not self._blocked_by_dedupe(symbol, "BUY"):
-                     log_status(f"📉 [{symbol}] BUY SIG: IBS {ibs:.3f} < {config['buy_thr']}")
+                     log_status(f"📉 [{symbol}] BUY SIG: IBS {ibs:.3f} < {config['buy_thr']} ({TF_DESCRIPTION})")
                      action = "BUY"
 
         if action:
@@ -517,9 +543,9 @@ class IBSBasketRunner:
                 if qty > 0:
                     self._place_order(symbol, action, qty, price)
 
-    # ────────────────────────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════
     # ORDER EXECUTION
-    # ────────────────────────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════
     def _place_order(self, symbol: str, action: str, qty: int, price: float):
         contract = self.contracts[symbol]
         order = MarketOrder(action, qty)
@@ -527,15 +553,13 @@ class IBSBasketRunner:
         if ACCOUNT_ID: order.account = ACCOUNT_ID
         
         trade = self.ib.placeOrder(contract, order)
-        
-        # PRESERVED: Uses updateEvent as per IBS.txt (source line 62)
         trade.updateEvent += lambda t=trade: self._on_trade_update(t)
         
         self.last_trade_time = self._now()
         self.last_action_map[symbol] = action
         self.last_price_map[symbol] = price
         
-        msg = f"🚀 [{symbol}] {action} x{qty} sent (Ref: {APP_NAME})"
+        msg = f"🚀 [{symbol}] {action} x{qty} sent ({TF_DESCRIPTION}, Ref: {APP_NAME})"
         log_status(msg)
         send_alert(msg, APP_NAME)
 
@@ -565,29 +589,27 @@ class IBSBasketRunner:
                      self.positions[symbol] = "NONE"
                      self.quantities[symbol] = 0
             
-            # [NEW] Save Basket State for Reconnection
             save_basket_state(self.positions, self.quantities, self.entry_prices, self.entry_times)
 
             self._logged_order_ids[oid] = True
             
-            msg = f"✅ [{symbol}] FILLED: {action} {filled} @ {avg_price}"
+            msg = f"✅ [{symbol}] FILLED: {action} {filled} @ {avg_price} ({TF_DESCRIPTION})"
             log_status(msg)
             send_alert(msg, APP_NAME)
             
-            # Matches IBS.txt: Hardcoded PnL/Duration = 0.0
             row = TradeRow(
                 timestamp=self._now(), symbol=symbol, action=action,
                 price=avg_price, quantity=int(filled), pnl=0.0, duration=0.0,
                 position=self.positions[symbol], status=status, ib_order_id=oid,
-                extra={"avgFillPrice": avg_price, "filled": filled}
+                extra={"avgFillPrice": avg_price, "filled": filled, "timeframe": TIMEFRAME}
             )
             with self.lock: self.trade_log_buffer.append(row)
             self._flush_trade_log_buffer()
             self._write_heartbeat()
 
-    # ────────────────────────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════
     # MARKET DATA HANDLERS
-    # ────────────────────────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════
     def _on_bar_update(self, bars, hasNewBar, symbol):
         if hasNewBar:
             self.daily_bars_map[symbol].clear()
@@ -608,13 +630,14 @@ class IBSBasketRunner:
         if price and price > 0:
             self._process_symbol(symbol, float(price))
 
-    # ────────────────────────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════
     # MAIN RUNNER (RECONNECT ENABLED)
-    # ────────────────────────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════
     def run(self):
         global CLIENT_ID
         
-        send_alert(f"🚀 <b>[{APP_NAME}]</b> Started.\nMode: {CAPITAL_MODE}", APP_NAME)
+        send_alert(f"🚀 <b>[{APP_NAME}]</b> Started.\nMode: {CAPITAL_MODE}\nTimeframe: {TF_DESCRIPTION}", APP_NAME)
+        log_status(f"📊 Running with {TF_DESCRIPTION} (Bar Size: {HIST_BAR_SIZE}, Duration: {HIST_DURATION})")
         self._update_weather()
         
         while not self._stop:
@@ -646,7 +669,7 @@ class IBSBasketRunner:
                 self.ib.reqAccountSummary()
                 self.ib.accountSummaryEvent += self._on_account_summary
 
-                # 3. SUBSCRIBE DATA (Resetting maps on new connection)
+                # 3. SUBSCRIBE DATA
                 for s in IBS_STOCKS:
                     sym = s['symbol']
                     c = self.contracts[sym]
@@ -668,7 +691,7 @@ class IBSBasketRunner:
                     
                     time.sleep(0.1) 
                     
-                log_status("✅ Market Data Subscribed. Monitoring...")
+                log_status(f"✅ Market Data Subscribed ({TF_DESCRIPTION}). Monitoring...")
                 self._write_heartbeat("running")
 
                 # 4. MONITOR LOOP
