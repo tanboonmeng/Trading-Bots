@@ -301,12 +301,16 @@ class StrategyRunner:
     def _restore_state(self):
         saved_data = load_basket_state()
         if not saved_data or "positions" not in saved_data:
+            log_status("No previous basket state found.")
             return
 
         positions_data = saved_data["positions"]
         self.symbols = list(positions_data.keys())
         
         log_status("♻️ Restoring Basket State...")
+        log_status(f"Last updated: {saved_data.get('last_updated', 'Unknown')}")
+        
+        has_positions = False
         for sym, p_data in positions_data.items():
             state = PositionState(sym)
             state.status = p_data.get("status", "NONE")
@@ -321,8 +325,15 @@ class StrategyRunner:
             self.positions[sym] = state
             self.contracts[sym] = Stock(sym, "SMART", "USD")
             
-            if state.status == "LONG":
-                log_status(f"   -> {sym}: LONG {state.qty} shares")
+            if state.status == "LONG" and state.qty > 0:
+                has_positions = True
+                entry_info = f" @ ${state.entry_price:.2f}" if state.entry_price else ""
+                log_status(f"   -> {sym}: LONG {state.qty} shares{entry_info}")
+        
+        if not has_positions:
+            log_status("   -> No active positions found in state.")
+        
+        log_status(f"♻️ Restored basket with {len(self.symbols)} symbols: {self.symbols}")
 
     # ─────────────────────────────
     # TRADING LOGIC
@@ -500,7 +511,7 @@ class StrategyRunner:
             except Exception as e:
                 log_status(f"Failed to setup {sym}: {e}")
 
-        log_status(f"Setup Complete. Monitoring: {self.symbols}")
+        log_status(f"✅ Setup Complete. Monitoring: {self.symbols}")
 
     def run(self) -> None:
         global CLIENT_ID
@@ -513,8 +524,8 @@ class StrategyRunner:
                     log_status(f"Connecting to {HOST}:{PORT} (ID: {CLIENT_ID})...")
                     try:
                         self.ib.connect(HOST, PORT, clientId=CLIENT_ID, readonly=False)
-                        log_status("✅ Connected")
-                        send_alert(f"✅ <b>[{APP_NAME}]</b> Connected", APP_NAME)
+                        log_status("✅ Connected to Interactive Brokers")
+                        send_alert(f"✅ <b>[{APP_NAME}]</b> Connected (ID: {CLIENT_ID})", APP_NAME)
                     except Exception as e:
                         if "already in use" in str(e).lower():
                             CLIENT_ID = bump_client_id(APP_NAME, "strategy")
