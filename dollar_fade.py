@@ -502,7 +502,11 @@ class StrategyRunner:
                         self.ib.connect(HOST, PORT, clientId=CLIENT_ID, readonly=False)
                         self.ib.qualifyContracts(self.contract)
                         log_status(f"✅ Connected. Contract: {self.contract}")
-                        send_alert(f"✅ <b>[{APP_NAME}]</b> Connected", APP_NAME)
+                        
+                        # [NEW] Position Status Check after Reconnection
+                        log_status(f"📊 Current Position: {self.current_position} | Qty: {self.current_qty} | Entry: {self.entry_price}")
+                        
+                        send_alert(f"✅ <b>[{APP_NAME}]</b> Connected (ID: {CLIENT_ID})", APP_NAME)
                     except Exception as e:
                         if "already in use" in str(e).lower():
                             CLIENT_ID = bump_client_id(APP_NAME, "strategy")
