@@ -5,8 +5,9 @@ Live Trading Runner - AUTO-RECONNECT, TELEGRAM & BASKET STATE
 Features:
 - Multi-Timeframe Support: Daily or Hourly bars
 - Auto-Reconnection: Survives TWS disconnects.
-- Telegram Alerts: Notifies on Trades and Errors.
-- Basket State Persistence: Remembers positions after restart.
+- Telegram Alerts: Notifies on Trades and Errors (Network Safe).
+- Basket State Persistence: Remembers positions (and Pending states) after restart.
+- Smart Logging: Checks account balance before logging BUY signals.
 """
 
 import os
@@ -86,7 +87,7 @@ CURRENCY = "USD"
 
 # Capital Allocation
 CAPITAL_MODE = "PERCENTAGE"      
-CAPITAL_FIXED_AMOUNT = 2000.0    
+CAPITAL_FIXED_AMOUNT = 2000.0 
 CAPITAL_PERCENTAGE = 0.02        
 CASH_TAG = "TotalCashBalance" 
 MIN_QTY = 1
@@ -161,6 +162,13 @@ def log_status(msg: str) -> None:
             f.write(line + "\n")
     except Exception:
         pass
+
+def safe_send_alert(msg, app_name):
+    """Wrapper to prevent network errors from crashing the bot"""
+    try:
+        send_alert(msg, app_name)
+    except Exception as e:
+        log_status(f"⚠️ Telegram Alert Failed: {e}")
 
 def load_weather_report():
     try:
@@ -505,6 +513,13 @@ class IBSBasketRunner:
                  return False
 
         current_pos = self.positions[symbol]
+        
+        # --- NEW SAFEGUARD: Respect Pending State ---
+        if current_pos == "PENDING":
+            log_status(f"⚠️ [{symbol}] Blocked {action}: Position is PENDING")
+            return False
+        # --------------------------------------------
+
         if action == "BUY" and current_pos == "LONG": return False
         if action == "SELL" and current_pos == "NONE": return False
         return True
@@ -524,16 +539,22 @@ class IBSBasketRunner:
         config = self.config_map[symbol]
         action = None
         
-        # SELL Logic
+        # 1. SELL Logic (Always runs, regardless of cash)
         if self.positions[symbol] == "LONG" and ibs > config['sell_thr']:
             log_status(f"📈 [{symbol}] SELL SIG: IBS {ibs:.3f} > {config['sell_thr']} ({TF_DESCRIPTION})")
             action = "SELL"
             
-        # BUY Logic
+        # 2. BUY Logic (Now checks Cash FIRST)
         elif self.positions[symbol] == "NONE" and ibs < config['buy_thr']:
+            
+            # --- NEW CHECK: Skip if we have no cash data yet ---
+            if self.account_cash <= 0:
+                return # Fail silently until cash arrives to prevent spam
+
             allowed, _, _ = self._check_weather_permission()
             if allowed:
                 if not self._blocked_by_dedupe(symbol, "BUY"):
+                     # Now we only log if we have cash AND permission
                      log_status(f"📉 [{symbol}] BUY SIG: IBS {ibs:.3f} < {config['buy_thr']} ({TF_DESCRIPTION})")
                      action = "BUY"
 
@@ -548,12 +569,22 @@ class IBSBasketRunner:
     # ════════════════════════════════════════════════════════════════
     def _place_order(self, symbol: str, action: str, qty: int, price: float):
         contract = self.contracts[symbol]
+        
+        # 1. LOCK STATE IMMEDIATELY (Prevent Pyramiding on Restart)
+        if action == "BUY":
+            self.positions[symbol] = "PENDING"
+            # Save strictly to prevent "Zombie" buys on restart
+            save_basket_state(self.positions, self.quantities, self.entry_prices, self.entry_times)
+
         order = MarketOrder(action, qty)
         order.orderRef = APP_NAME
         if ACCOUNT_ID: order.account = ACCOUNT_ID
         
+        # 2. PLACE ORDER
         trade = self.ib.placeOrder(contract, order)
-        trade.updateEvent += lambda t=trade: self._on_trade_update(t)
+        
+        # 3. FIX CRASH: Use statusEvent instead of updateEvent
+        trade.statusEvent += self._on_trade_update
         
         self.last_trade_time = self._now()
         self.last_action_map[symbol] = action
@@ -561,7 +592,7 @@ class IBSBasketRunner:
         
         msg = f"🚀 [{symbol}] {action} x{qty} sent ({TF_DESCRIPTION}, Ref: {APP_NAME})"
         log_status(msg)
-        send_alert(msg, APP_NAME)
+        safe_send_alert(msg, APP_NAME)
 
     def _on_trade_update(self, trade: Trade):
         if not trade.contract: return
@@ -569,6 +600,14 @@ class IBSBasketRunner:
         status = trade.orderStatus.status
         filled = trade.orderStatus.filled
         oid = trade.order.orderId
+        
+        # --- NEW: Release Lock if Cancelled ---
+        if status in ["Cancelled", "Inactive", "ApiCancelled"] and self.positions[symbol] == "PENDING":
+            log_status(f"⚠️ [{symbol}] Order {status}. Resetting PENDING to NONE.")
+            self.positions[symbol] = "NONE"
+            save_basket_state(self.positions, self.quantities, self.entry_prices, self.entry_times)
+            return
+        # --------------------------------------
         
         if status.lower() not in ("filled", "partiallyfilled"): return
         if self._logged_order_ids.get(oid): return
@@ -595,7 +634,7 @@ class IBSBasketRunner:
             
             msg = f"✅ [{symbol}] FILLED: {action} {filled} @ {avg_price} ({TF_DESCRIPTION})"
             log_status(msg)
-            send_alert(msg, APP_NAME)
+            safe_send_alert(msg, APP_NAME)
             
             row = TradeRow(
                 timestamp=self._now(), symbol=symbol, action=action,
@@ -636,7 +675,7 @@ class IBSBasketRunner:
     def run(self):
         global CLIENT_ID
         
-        send_alert(f"🚀 <b>[{APP_NAME}]</b> Started.\nMode: {CAPITAL_MODE}\nTimeframe: {TF_DESCRIPTION}", APP_NAME)
+        safe_send_alert(f"🚀 <b>[{APP_NAME}]</b> Started.\nMode: {CAPITAL_MODE}\nTimeframe: {TF_DESCRIPTION}", APP_NAME)
         log_status(f"📊 Running with {TF_DESCRIPTION} (Bar Size: {HIST_BAR_SIZE}, Duration: {HIST_DURATION})")
         self._update_weather()
         
@@ -648,7 +687,7 @@ class IBSBasketRunner:
                     try:
                         self.ib.connect(HOST, PORT, clientId=CLIENT_ID)
                         log_status("✅ Connected")
-                        send_alert(f"✅ <b>[{APP_NAME}]</b> Connected (ID: {CLIENT_ID})", APP_NAME)
+                        safe_send_alert(f"✅ <b>[{APP_NAME}]</b> Connected (ID: {CLIENT_ID})", APP_NAME)
                     except Exception as e:
                         if "already in use" in str(e).lower():
                             CLIENT_ID = bump_client_id(APP_NAME, "strategy")
@@ -690,7 +729,7 @@ class IBSBasketRunner:
                     tick.updateEvent += self._on_tick
                     
                     time.sleep(0.1) 
-                    
+            
                 log_status(f"✅ Market Data Subscribed ({TF_DESCRIPTION}). Monitoring...")
                 self._write_heartbeat("running")
 
@@ -703,7 +742,7 @@ class IBSBasketRunner:
             except Exception as e:
                 err_msg = f"⚠️ <b>[{APP_NAME}]</b> CRITICAL DISCONNECT!\nError: {str(e)}"
                 log_status(err_msg)
-                send_alert(err_msg, APP_NAME)
+                safe_send_alert(err_msg, APP_NAME)
                 self._write_heartbeat("disconnected")
 
             finally:
@@ -715,7 +754,7 @@ class IBSBasketRunner:
                     time.sleep(10)
 
         log_status("🛑 Bot Stopped.")
-        send_alert(f"🛑 <b>[{APP_NAME}]</b> Bot Stopped.", APP_NAME)
+        safe_send_alert(f"🛑 <b>[{APP_NAME}]</b> Bot Stopped.", APP_NAME)
 
 if __name__ == "__main__":
     runner = IBSBasketRunner()
