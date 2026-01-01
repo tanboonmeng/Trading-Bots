@@ -1,5 +1,9 @@
 """
 VWAP Z-score Trend Long Strategy (Regime-Aware) - PERSISTENT & AUTO-RECONNECT
+Features:
+- Scanner-Style Heartbeat: Reports live Z-scores for all stocks.
+- Efficient Weather Check: Only checks regime when a signal is detected.
+- Unified Persistence: Saves positions and history in one state file.
 """
 
 import os
@@ -25,7 +29,6 @@ if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
 from utils.client_id_manager import get_or_allocate_client_id, bump_client_id
-# [NEW] Import the shared Telegram Alert function
 from utils.telegram_alert import send_alert
 
 # ────────────────────────────────────────────────────────────────
@@ -208,7 +211,7 @@ class VWAPZscoreRunner:
 
     def _now(self):
         return dt.datetime.now()
-        
+    
     def _on_account_summary(self, val):
         if val.tag == "TotalCashBalance" and val.currency == "BASE":
             try:
@@ -334,16 +337,33 @@ class VWAPZscoreRunner:
         df.to_csv(TRADE_LOG_PATH, index=False)
 
     def _write_heartbeat(self, status="running"):
-        pos = {s: st.quantity for s, st in self.symbols.items() if st.quantity > 0}
+        # --- NEW: Scanner-Style Heartbeat ---
+        # Instead of only showing active positions, we show data for ALL tracked stocks.
+        tickers_status = {}
+        
+        for sym, state in self.symbols.items():
+            # Calculate the live Z-score for the dashboard (Scanner Mode)
+            result = self._compute_vwap_zscore(sym)
+            current_z = result[1] if result else None
+            current_vwap = result[2] if result else None
+            
+            tickers_status[sym] = {
+                "position": state.position,
+                "qty": state.quantity,
+                "z_score": round(current_z, 3) if current_z is not None else None,
+                "vwap": round(current_vwap, 2) if current_vwap is not None else None
+            }
+
         data = {
             "app_name": APP_NAME,
             "status": status,
             "last_update": self._now().isoformat(),
-            "positions": pos, 
+            "tickers": tickers_status,  # Shows ALL stocks + Z-scores
             "net_liq": self.net_liq,
             "total_cash_base": self.total_cash,
             "capital_mode": CAPITAL_MODE
         }
+        
         try:
             with open(HEARTBEAT_PATH, "w") as f:
                 json.dump(data, f, indent=2)
