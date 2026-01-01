@@ -8,6 +8,8 @@ Features:
 - Telegram Alerts: Notifies on Trades and Errors (Network Safe).
 - Basket State Persistence: Remembers positions (and Pending states) after restart.
 - Smart Logging: Checks account balance before logging BUY signals.
+- CSV Fix: Consistent timestamp formatting.
+- EFFICIENT WEATHER: Only checks weather on Entry Signal or when Sleeping.
 """
 
 import os
@@ -74,12 +76,12 @@ TF_DESCRIPTION = ACTIVE_TF["description"]
 
 # ---------------- STOCK BASKET CONFIGURATION ----------------
 IBS_STOCKS = [
-    {'symbol': 'AAPL',  'buy_thr': 0.08, 'sell_thr': 0.98},
-    {'symbol': 'MSFT',  'buy_thr': 0.15, 'sell_thr': 0.97},
-    {'symbol': 'NVDA',  'buy_thr': 0.15, 'sell_thr': 0.99},
-    {'symbol': 'TSM',   'buy_thr': 0.15, 'sell_thr': 0.99},
-    {'symbol': 'META',  'buy_thr': 0.09, 'sell_thr': 0.87},
-    {'symbol': 'GOOGL', 'buy_thr': 0.07, 'sell_thr': 0.83},
+    {'symbol': 'AAPL',  'buy_thr': 0.41, 'sell_thr': 0.61},
+    {'symbol': 'MSFT',  'buy_thr': 0.42, 'sell_thr': 0.62},
+    {'symbol': 'NVDA',  'buy_thr': 0.43, 'sell_thr': 0.63},
+    {'symbol': 'TSM',   'buy_thr': 0.44, 'sell_thr': 0.64},
+    {'symbol': 'META',  'buy_thr': 0.45, 'sell_thr': 0.65},
+    {'symbol': 'GOOGL', 'buy_thr': 0.46, 'sell_thr': 0.66},
 ]
 
 EXCHANGE = "SMART"
@@ -335,7 +337,7 @@ class IBSBasketRunner:
             rows = []
             for r in self.trade_log_buffer:
                 rows.append({
-                    "timestamp": r.timestamp.isoformat(),
+                    "timestamp": str(r.timestamp), 
                     "symbol": r.symbol, "action": r.action, "price": r.price,
                     "quantity": r.quantity, "pnl": r.pnl, "duration": r.duration,
                     "position": r.position, "status": r.status, "ib_order_id": r.ib_order_id,
@@ -408,10 +410,6 @@ class IBSBasketRunner:
             next_check = next_check + dt.timedelta(days=1)
         return next_check
 
-    def _should_check_weather_now(self) -> bool:
-        if self.next_weather_check is None: return True
-        return self._now() >= self.next_weather_check
-
     def _update_weather(self):
         with self.weather_lock:
             if WEATHER_BYPASS_MODE:
@@ -448,8 +446,10 @@ class IBSBasketRunner:
     def _check_weather_permission(self) -> tuple:
         if self.last_weather_check is None or (not self.is_sleeping and (self._now() - self.last_weather_check).total_seconds() >= WEATHER_CHECK_INTERVAL):
             self._update_weather()
-        elif self.is_sleeping and self._should_check_weather_now():
-             self._update_weather()
+        elif self.is_sleeping:
+             # If sleeping, check every 5 minutes (300s) to see if we can wake up
+             if self.last_weather_check and (self._now() - self.last_weather_check).total_seconds() >= 300:
+                  self._update_weather()
              
         if WEATHER_BYPASS_MODE:
             return True, "BYPASS", "GO"
@@ -514,11 +514,9 @@ class IBSBasketRunner:
 
         current_pos = self.positions[symbol]
         
-        # --- NEW SAFEGUARD: Respect Pending State ---
         if current_pos == "PENDING":
             log_status(f"⚠️ [{symbol}] Blocked {action}: Position is PENDING")
             return False
-        # --------------------------------------------
 
         if action == "BUY" and current_pos == "LONG": return False
         if action == "SELL" and current_pos == "NONE": return False
@@ -539,22 +537,20 @@ class IBSBasketRunner:
         config = self.config_map[symbol]
         action = None
         
-        # 1. SELL Logic (Always runs, regardless of cash)
+        # 1. SELL Logic
         if self.positions[symbol] == "LONG" and ibs > config['sell_thr']:
             log_status(f"📈 [{symbol}] SELL SIG: IBS {ibs:.3f} > {config['sell_thr']} ({TF_DESCRIPTION})")
             action = "SELL"
             
-        # 2. BUY Logic (Now checks Cash FIRST)
+        # 2. BUY Logic
         elif self.positions[symbol] == "NONE" and ibs < config['buy_thr']:
-            
-            # --- NEW CHECK: Skip if we have no cash data yet ---
             if self.account_cash <= 0:
-                return # Fail silently until cash arrives to prevent spam
+                return 
 
+            # --- EFFICIENT: Check Weather Only Here (Lazy) ---
             allowed, _, _ = self._check_weather_permission()
             if allowed:
                 if not self._blocked_by_dedupe(symbol, "BUY"):
-                     # Now we only log if we have cash AND permission
                      log_status(f"📉 [{symbol}] BUY SIG: IBS {ibs:.3f} < {config['buy_thr']} ({TF_DESCRIPTION})")
                      action = "BUY"
 
@@ -570,20 +566,15 @@ class IBSBasketRunner:
     def _place_order(self, symbol: str, action: str, qty: int, price: float):
         contract = self.contracts[symbol]
         
-        # 1. LOCK STATE IMMEDIATELY (Prevent Pyramiding on Restart)
         if action == "BUY":
             self.positions[symbol] = "PENDING"
-            # Save strictly to prevent "Zombie" buys on restart
             save_basket_state(self.positions, self.quantities, self.entry_prices, self.entry_times)
 
         order = MarketOrder(action, qty)
         order.orderRef = APP_NAME
         if ACCOUNT_ID: order.account = ACCOUNT_ID
         
-        # 2. PLACE ORDER
         trade = self.ib.placeOrder(contract, order)
-        
-        # 3. FIX CRASH: Use statusEvent instead of updateEvent
         trade.statusEvent += self._on_trade_update
         
         self.last_trade_time = self._now()
@@ -601,13 +592,11 @@ class IBSBasketRunner:
         filled = trade.orderStatus.filled
         oid = trade.order.orderId
         
-        # --- NEW: Release Lock if Cancelled ---
         if status in ["Cancelled", "Inactive", "ApiCancelled"] and self.positions[symbol] == "PENDING":
             log_status(f"⚠️ [{symbol}] Order {status}. Resetting PENDING to NONE.")
             self.positions[symbol] = "NONE"
             save_basket_state(self.positions, self.quantities, self.entry_prices, self.entry_times)
             return
-        # --------------------------------------
         
         if status.lower() not in ("filled", "partiallyfilled"): return
         if self._logged_order_ids.get(oid): return
@@ -616,7 +605,6 @@ class IBSBasketRunner:
             avg_price = trade.orderStatus.avgFillPrice
             action = trade.order.action.upper()
             
-            # Update Internal State
             if action == "BUY":
                 self.positions[symbol] = "LONG"
                 self.quantities[symbol] = int(filled)
@@ -658,10 +646,12 @@ class IBSBasketRunner:
     def _on_tick(self, ticker):
         if self._stop: return
         
+        # --- EFFICIENT: Only check if sleeping (to allow wake up) ---
         if self.is_sleeping:
-             if self._should_check_weather_now():
+             # Check every 5 mins to see if we can wake up
+             if self._should_check_weather_now() or (self.last_weather_check and (self._now() - self.last_weather_check).total_seconds() >= 300):
                  self._update_weather()
-             return
+             return # Skip processing since we are sleeping/blocked
 
         if not ticker.contract: return
         symbol = ticker.contract.symbol
