@@ -10,6 +10,8 @@ Features:
 - Smart Logging: Checks account balance before logging BUY signals.
 - CSV Fix: Consistent timestamp formatting.
 - EFFICIENT WEATHER: Only checks weather on Entry Signal or when Sleeping.
+- [NEW] STRICT TIME WINDOW: Enforces 09:30-16:00 ET for Market Orders.
+- [NEW] DEDUPLICATION FIX: Records attempts on placement, not fill.
 """
 
 import os
@@ -455,7 +457,7 @@ class IBSBasketRunner:
             return True, "BYPASS", "GO"
         
         with self.weather_lock:
-            return check_trading_permission(self.current_weather, "mean_reversion")
+             return check_trading_permission(self.current_weather, "mean_reversion")
 
     # ════════════════════════════════════════════════════════════════
     # TRADING LOGIC
@@ -475,7 +477,7 @@ class IBSBasketRunner:
             if REENTRY_COOLDOWN_MIN > 0 and (now - last_ts).total_seconds() < (REENTRY_COOLDOWN_MIN * 60):
                 return True
             if DAILY_SINGLE_ENTRY and now.date() == last_ts.date():
-                return True
+                 return True
         except:
             return False
         return False
@@ -510,7 +512,7 @@ class IBSBasketRunner:
         
         if last_act == action and last_prc:
              if abs(price - last_prc) / last_prc < MIN_SAME_ACTION_REPRICE:
-                 return False
+                  return False
 
         current_pos = self.positions[symbol]
         
@@ -523,6 +525,31 @@ class IBSBasketRunner:
         return True
 
     def _process_symbol(self, symbol: str, price: float):
+        # -----------------------------------------------------------
+        # [FIX] 1. TIME ALIGNMENT: Enforce US Eastern Market Hours
+        # -----------------------------------------------------------
+        try:
+            # Convert current time to US/Eastern explicitly
+            now_et = pd.Timestamp.now(tz='US/Eastern')
+            
+            # Check Weekday (Mon=0, Sun=6). Skip weekends.
+            if now_et.dayofweek >= 5: 
+                return
+
+            # Check Time (09:30 to 16:00 ET)
+            current_time = now_et.time()
+            start_time = dt.time(9, 30)
+            end_time = dt.time(16, 00) # strict cutoff at closing bell
+
+            if not (start_time <= current_time < end_time):
+                # Market is closed; ignore this tick to avoid MarketOrder errors
+                return
+        except Exception as e:
+            # Fallback if timezone conversion fails (rare)
+            log_status(f"⚠️ Time check error: {e}")
+            return
+        # -----------------------------------------------------------
+
         if not self.bars_ready_map[symbol]: return
 
         self.tick_counts[symbol] += 1
@@ -568,6 +595,8 @@ class IBSBasketRunner:
         
         if action == "BUY":
             self.positions[symbol] = "PENDING"
+            # [FIX] 2. RECORD ATTEMPT HERE: Prevent re-fire if order is cancelled
+            self._record_action(symbol, "BUY") 
             save_basket_state(self.positions, self.quantities, self.entry_prices, self.entry_times)
 
         order = MarketOrder(action, qty)
@@ -610,7 +639,7 @@ class IBSBasketRunner:
                 self.quantities[symbol] = int(filled)
                 self.entry_prices[symbol] = avg_price
                 self.entry_times[symbol] = self._now()
-                self._record_action(symbol, "BUY")
+                # [FIX] REMOVED REDUNDANT RECORD_ACTION
             elif action == "SELL" and self.positions[symbol] == "LONG":
                  if filled >= self.quantities[symbol]:
                      self.positions[symbol] = "NONE"
@@ -719,7 +748,7 @@ class IBSBasketRunner:
                     tick.updateEvent += self._on_tick
                     
                     time.sleep(0.1) 
-            
+             
                 log_status(f"✅ Market Data Subscribed ({TF_DESCRIPTION}). Monitoring...")
                 self._write_heartbeat("running")
 
