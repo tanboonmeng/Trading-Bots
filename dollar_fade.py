@@ -5,6 +5,7 @@ Features:
 - Telegram Alerts (Entries, Exits, Disconnects)
 - ISOLATED STATE: Uses a JSON file to track positions (Safe for shared accounts)
 - Sustainable Logic (Throttled Ticks)
+- [FIXED] Timestamp Logging, Live Cash Stream, Timezone Safety
 """
 
 import os
@@ -21,9 +22,10 @@ import numpy as np
 import datetime as dt
 from zoneinfo import ZoneInfo
 
+# [FIX] Removed 'AccountSummary' from import to prevent ImportError
 from ib_insync import (
     IB, Stock, Forex, Index, Future, Option, Contract as IBContract,
-    MarketOrder, Trade,
+    MarketOrder, Trade, AccountValue
 )
 
 # ─────────────────────────────────────────────────────────────
@@ -34,7 +36,6 @@ if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
 from utils.client_id_manager import get_or_allocate_client_id, bump_client_id
-# [NEW] Telegram Import
 from utils.telegram_alert import send_alert
 
 # ─────────────────────────────────────────────────────────────
@@ -54,15 +55,15 @@ CURRENCY = "USD"
 
 # ─── STRATEGY DATES (Fixed Entry/Exit) ───
 # Entry: December 23rd
-ENTRY_MONTH = 12
-ENTRY_DAY = 23
+ENTRY_MONTH = 1
+ENTRY_DAY = 2
 
 # Exit: January 2nd
 EXIT_MONTH = 1
-EXIT_DAY = 2
+EXIT_DAY = 3
 
 # ─── CAPITAL SIZING SETTINGS ───
-CAPITAL_MODE = "FIXED"      # "FIXED" or "PERCENTAGE"
+CAPITAL_MODE = "PERCENTAGE"      # "FIXED" or "PERCENTAGE"
 CAPITAL_FIXED_AMOUNT = 2000.0 
 CAPITAL_PCT = 0.02
 
@@ -80,7 +81,6 @@ os.makedirs(LOG_ROOT, exist_ok=True)
 TRADE_LOG_PATH = os.path.join(LOG_ROOT, "trade_log.csv")
 HEARTBEAT_PATH = os.path.join(LOG_ROOT, "heartbeat.json")
 STATUS_LOG_PATH = os.path.join(LOG_ROOT, "status.log")
-# [NEW] Isolated State File
 STATE_FILE = os.path.join(LOG_ROOT, "state_Dollar_Fade.json")
 
 CLIENT_ID = get_or_allocate_client_id(name=APP_NAME, role="strategy", preferred=None)
@@ -122,7 +122,6 @@ def log_status(msg: str) -> None:
 # STATE MANAGEMENT (JSON)
 # ─────────────────────────────────────────────────────────────
 def load_state() -> Dict[str, Any]:
-    """Loads the isolated position state for THIS bot only."""
     if not os.path.exists(STATE_FILE):
         return {}
     try:
@@ -133,7 +132,6 @@ def load_state() -> Dict[str, Any]:
         return {}
 
 def save_state(position: str, qty: int, entry_price: float, entry_time: Optional[dt.datetime]):
-    """Saves the current position to disk."""
     data = {
         "current_position": position,
         "current_qty": qty,
@@ -177,6 +175,9 @@ class StrategyRunner:
         # SUSTAINABILITY: Tick Throttling
         self.last_tick_check: Optional[dt.datetime] = None
         self.tick_throttle_sec = 1.0 
+
+        # [NEW] CACHED CASH BALANCE (Streamed via AccountSummary)
+        self.cached_cash_balance: float = 0.0
         
         # Restore State on Init
         self._restore_state()
@@ -202,6 +203,8 @@ class StrategyRunner:
             if t_str:
                 try:
                     self.entry_time = dt.datetime.fromisoformat(t_str)
+                    if self.entry_time.tzinfo is None:
+                        self.entry_time = self.entry_time.replace(tzinfo=ZoneInfo("America/New_York"))
                 except: pass
             
             log_status(f"♻️ RESTORED STATE: {self.current_position} {self.current_qty} {SYMBOL} @ {self.entry_price}")
@@ -209,7 +212,7 @@ class StrategyRunner:
             log_status("ℹ️ No active position in State File.")
 
     # ─────────────────────────────
-    # FILE IO
+    # FILE IO (REVISED)
     # ─────────────────────────────
     def _flush_trade_log_buffer(self) -> None:
         with self.lock:
@@ -217,7 +220,8 @@ class StrategyRunner:
             rows = []
             for r in self.trade_log_buffer:
                 rows.append({
-                    "timestamp": r.timestamp.isoformat(),
+                    # [FIXED] Pass datetime object directly to avoid format mismatches
+                    "timestamp": r.timestamp,
                     "symbol": r.symbol, "action": r.action, "price": r.price,
                     "quantity": r.quantity, "pnl": r.pnl, "duration": r.duration,
                     "position": r.position, "status": r.status,
@@ -236,8 +240,9 @@ class StrategyRunner:
         else:
             df = df_new
 
+        # [FIXED] Use 'mixed' format to handle different date string styles safely
         if "timestamp" in df.columns:
-            df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+            df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", format="mixed")
 
         df["dedup_key"] = (
             df["timestamp"].astype(str) + "|" + df["symbol"].astype(str) + 
@@ -260,6 +265,7 @@ class StrategyRunner:
             "position_qty": self.current_qty,
             "entry_price": self.entry_price,
             "last_price": last_price,
+            "cached_cash": self.cached_cash_balance
         }
         try:
             with open(HEARTBEAT_PATH, "w", encoding="utf-8") as f:
@@ -296,26 +302,34 @@ class StrategyRunner:
             
         return True
 
+    # [FIX] Relaxed Account Summary Handler
+    def _on_account_summary(self, val):
+        """
+        Stream handler for Account Summary. 
+        Updates cash balance whenever 'TotalCashBalance' is received.
+        Removed strict 'val.account == ACCOUNT_ID' check to ensure we capture
+        data even if casing mismatches or alias is used.
+        """
+        if val.tag == "TotalCashBalance" and val.currency == "BASE":
+            try:
+                new_cash = float(val.value)
+                if new_cash != self.cached_cash_balance:
+                    self.cached_cash_balance = new_cash
+            except: pass
+
     def _get_capital_allocation(self) -> float:
+        """
+        Now uses cached_cash_balance which is live-updated by the summary stream.
+        """
         if CAPITAL_MODE == "FIXED":
             return CAPITAL_FIXED_AMOUNT
 
         elif CAPITAL_MODE == "PERCENTAGE":
-            try:
-                summary = self.ib.accountSummary(ACCOUNT_ID if ACCOUNT_ID else "All")
-                cash_tag = next(
-                    (v for v in summary if v.tag == "TotalCashBalance" and v.currency == "BASE"), 
-                    None
-                )
-                if cash_tag:
-                    total_cash = float(cash_tag.value)
-                    alloc = total_cash * CAPITAL_PCT
-                    return alloc
-                else:
-                    return 0.0
-            except Exception as e:
-                log_status(f"Error fetching account summary: {e}")
+            if self.cached_cash_balance > 0:
+                return self.cached_cash_balance * CAPITAL_PCT
+            else:
                 return 0.0
+                
         return 0.0
 
     def _qty_for_price(self, price: float) -> int:
@@ -336,13 +350,10 @@ class StrategyRunner:
         
         # 1. EXIT LOGIC - January 2nd OR LATER
         if self.current_position == "LONG":
-            # Primary Exit: Jan 2nd+
             if today_month == EXIT_MONTH and today_day >= EXIT_DAY:
                 log_status(f"Exit signal triggered on {now_et.strftime('%Y-%m-%d')} (Jan {EXIT_DAY}+)")
                 return "SELL"
             
-            # Safety Exit: Late months (Feb, Mar, etc.)
-            # CRITICAL FIX: Explicitly ignore December (Month 12) so we don't sell early
             if today_month > EXIT_MONTH and today_month != 12:
                 log_status(f"Late exit signal triggered on {now_et.strftime('%Y-%m-%d')}")
                 return "SELL"
@@ -367,8 +378,6 @@ class StrategyRunner:
         elif action == "SELL": self.current_position = "PENDING_SELL"
 
         trade: Trade = self.ib.placeOrder(self.contract, order)
-        
-        # Matches original logic: statusEvent for updates
         trade.statusEvent += self._on_trade_update
         
         self.last_trade_time = self._now()
@@ -407,21 +416,23 @@ class StrategyRunner:
             self.entry_price = price
             self.entry_time = now
             position_after = "LONG"
-            # [NEW] SAVE STATE
             save_state("LONG", qty, price, now)
 
         elif action == "SELL":
             if self.current_position == "LONG" and self.entry_price is not None:
                 pnl = (price - float(self.entry_price)) * qty
+            
             if self.entry_time is not None:
-                duration = (now - self.entry_time).total_seconds()
+                et_aware = self.entry_time
+                if et_aware.tzinfo is None and now.tzinfo is not None:
+                    et_aware = et_aware.replace(tzinfo=now.tzinfo)
+                duration = (now - et_aware).total_seconds()
 
             self.current_position = "NONE"
             self.current_qty = 0
             self.entry_price = None
             self.entry_time = None
             position_after = "NONE"
-            # [NEW] CLEAR STATE
             save_state("NONE", 0, 0.0, None)
 
         row = TradeRow(
@@ -446,13 +457,11 @@ class StrategyRunner:
     def _on_tick(self, _=None) -> None:
         if self._stop_requested or self._ticker is None: return
         
-        # SUSTAINABILITY: Tick Throttling
         now = self._now()
         if self.last_tick_check and (now - self.last_tick_check).total_seconds() < self.tick_throttle_sec:
             return 
         self.last_tick_check = now
 
-        # Handle NaN in Forex
         price = 0.0
         if self._ticker.last and not math.isnan(self._ticker.last):
             price = self._ticker.last
@@ -477,9 +486,15 @@ class StrategyRunner:
             self._write_heartbeat(status="running_no_trade", last_price=price)
             return
 
-        qty = self._qty_for_price(price)
+        if action == "SELL" and self.current_position == "LONG":
+            qty = self.current_qty
+        elif action == "BUY" and self.current_position == "SHORT": 
+            qty = self.current_qty
+        else:
+            qty = self._qty_for_price(price)
+
         if qty <= 0:
-            log_status(f"Signal {action} ignored: Qty calculated is 0")
+            log_status(f"Signal {action} ignored: Qty calculated is 0 (Waiting for Cash Data...)")
             return
 
         self._place_order(action, qty, price)
@@ -503,10 +518,22 @@ class StrategyRunner:
                         self.ib.qualifyContracts(self.contract)
                         log_status(f"✅ Connected. Contract: {self.contract}")
                         
-                        # [NEW] Position Status Check after Reconnection
+                        # [FIX] USE ACCOUNT SUMMARY STREAM (Zero Argument Version)
+                        self.ib.accountSummaryEvent += self._on_account_summary
+                        self.ib.reqAccountSummary() 
+                        log_status(f"✅ Cash Balance Stream Subscribed (via AccountSummary)")
+
                         log_status(f"📊 Current Position: {self.current_position} | Qty: {self.current_qty} | Entry: {self.entry_price}")
-                        
                         send_alert(f"✅ <b>[{APP_NAME}]</b> Connected (ID: {CLIENT_ID})", APP_NAME)
+
+                        # [FIX] STARTUP WARM-UP: Wait for cash data before continuing
+                        log_status("⏳ Waiting up to 5s for Cash Balance data...")
+                        for _ in range(50): # Wait up to 5 seconds
+                            if self.cached_cash_balance > 0:
+                                log_status(f"💰 Cash Balance Received: {self.cached_cash_balance:.2f} BASE")
+                                break
+                            self.ib.sleep(0.1)
+
                     except Exception as e:
                         if "already in use" in str(e).lower():
                             CLIENT_ID = bump_client_id(APP_NAME, "strategy")
