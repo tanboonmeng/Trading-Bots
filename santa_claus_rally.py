@@ -1,12 +1,3 @@
-"""
-IBKR-Confirmed Strategy Runner: Santa Claus Rally
-Features:
-- Auto-Reconnection (Survives TWS Restarts)
-- Telegram Alerts (Entries, Exits, Disconnects)
-- ISOLATED STATE: Uses a JSON file to track positions (Safe for shared accounts)
-- Sustainable Logic (Throttled Ticks)
-"""
-
 import os
 import sys
 import json
@@ -19,6 +10,7 @@ import pandas as pd
 import numpy as np
 import datetime as dt
 
+# [Requirement] Do NOT import AccountSummary explicitly to avoid conflicts
 from ib_insync import IB, Stock, MarketOrder, Trade
 
 # ─────────────────────────────────────────────────────────────
@@ -37,7 +29,7 @@ from utils.telegram_alert import send_alert
 APP_NAME = "Santa_Claus_Rally"
 
 HOST = "127.0.0.1"
-PORT = 7497                 
+PORT = 7497     
 ACCOUNT_ID = "DU3188670"    
 
 SYMBOL = "SPY"
@@ -61,7 +53,7 @@ os.makedirs(LOG_ROOT, exist_ok=True)
 TRADE_LOG_PATH = os.path.join(LOG_ROOT, "trade_log.csv")
 HEARTBEAT_PATH = os.path.join(LOG_ROOT, "heartbeat.json")
 STATUS_LOG_PATH = os.path.join(LOG_ROOT, "status.log")
-STATE_FILE = os.path.join(LOG_ROOT, "state_Santa_Claus.json") # [NEW] Isolated State
+STATE_FILE = os.path.join(LOG_ROOT, "state_Santa_Claus.json") 
 
 CLIENT_ID = get_or_allocate_client_id(name=APP_NAME, role="strategy", preferred=None)
 
@@ -135,13 +127,14 @@ class StrategyRunner:
         self.ib = IB()
         self.contract = Stock(SYMBOL, EXCHANGE, CURRENCY)
 
-        # Internal State (Loaded from JSON on startup)
+        # Internal State
         self.current_position: str = "NONE"
         self.current_qty: int = 0
         self.entry_price: Optional[float] = None
         self.entry_time: Optional[dt.datetime] = None
 
-        self.account_cash_balance: float = 0.0
+        # [NEW] LIVE CASH CACHE (Initialized to 0.0)
+        self.cached_cash_balance: float = 0.0
 
         # Pending Order Lock
         self.pending_order: bool = False
@@ -196,7 +189,7 @@ class StrategyRunner:
             rows = []
             for r in self.trade_log_buffer:
                 rows.append({
-                    "timestamp": r.timestamp.isoformat(),
+                    "timestamp": r.timestamp.strftime("%Y-%m-%d %H:%M:%S.%f"),
                     "symbol": r.symbol, "action": r.action, "price": r.price,
                     "quantity": r.quantity, "pnl": r.pnl, "duration": r.duration,
                     "position": r.position, "status": r.status, "ib_order_id": r.ib_order_id,
@@ -236,7 +229,7 @@ class StrategyRunner:
             "position_qty": self.current_qty,
             "entry_price": self.entry_price,
             "last_price": last_price,
-            "account_cash_base": self.account_cash_balance,
+            "account_cash_base": self.cached_cash_balance,
             "pending_order": self.pending_order
         }
         try:
@@ -280,12 +273,14 @@ class StrategyRunner:
         if CAPITAL_MODE == "FIXED":
             capital_to_use = FIXED_CAPITAL_AMOUNT
         elif CAPITAL_MODE == "PCT":
-            if self.account_cash_balance <= 0: return 0
-            capital_to_use = self.account_cash_balance * CAPITAL_PCT
+            # [FIX] Use the cached stream variable
+            if self.cached_cash_balance <= 0: 
+                log_status("⚠️ Cash Balance is 0 or not loaded. Qty = 0.")
+                return 0
+            capital_to_use = self.cached_cash_balance * CAPITAL_PCT
 
         max_qty = int(capital_to_use // price)
         
-        # [REVERTED] Enforce MIN_QTY logic from original source
         if max_qty < MIN_QTY: 
             return 0
             
@@ -311,24 +306,42 @@ class StrategyRunner:
         now = dt.datetime.now()
         today_key = now.strftime("%Y-%m-%d")
         
-        # 1. Check Entry (December)
+        # ─────────────────────────────────────────────────────────────
+        # [ACTIVE] TEST MODE: Specific Dates (Jan 2 Entry / Jan 5 Exit)
+        # ─────────────────────────────────────────────────────────────
+        """
+        # 1. TEST ENTRY: Force Buy on Jan 2
+        if now.month == 1 and now.day == 2:
+            if self.current_position == "NONE":
+                if self.last_buy_date == today_key: return None
+                log_status(f"SIGNAL: TEST BUY triggered (Date is Jan 2)")
+                return "BUY"
+
+        # 2. TEST EXIT: Force Sell on Jan 5
+        elif now.month == 1 and now.day == 5:
+            if self.current_position == "LONG":
+                if self.last_sell_date == today_key: return None
+                log_status(f"SIGNAL: TEST SELL triggered (Date is Jan 5)")
+                return "SELL"
+        """
+        # ─────────────────────────────────────────────────────────────
+        # ORIGINAL LOGIC (Commented out for testing)
+        # ─────────────────────────────────────────────────────────────
+        # # 1. Check Entry (December)
         if now.month == 12:
             if now.day >= 15: 
                 days_left = self._get_trading_days_remaining_in_year(now)
                 ENTRY_DAYS_LEFT = 5
-                
                 if days_left == ENTRY_DAYS_LEFT and self.current_position == "NONE":
                     if self.last_buy_date == today_key: return None
-                    log_status(f"SIGNAL: BUY triggered ({ENTRY_DAYS_LEFT} trading days left)")
                     return "BUY"
 
-        # 2. Check Exit (January)
+        # # 2. Check Exit (January)
         elif now.month == 1:
             if now.day <= 10:
                 jan_days = self._get_trading_days_elapsed_in_jan(now)
                 if jan_days >= 2 and self.current_position == "LONG":
                     if self.last_sell_date == today_key: return None
-                    log_status(f"SIGNAL: SELL triggered (2nd trading day of Jan)")
                     return "SELL"
         
         return None
@@ -352,9 +365,8 @@ class StrategyRunner:
 
         trade: Trade = self.ib.placeOrder(self.contract, order)
         
-        # [PRESERVED] Uses fillEvent/statusEvent from original source
-        trade.fillEvent += lambda t=trade: self._on_trade_update(t)
-        trade.statusEvent += lambda t=trade: self._on_trade_update(t)
+        trade.fillEvent += lambda *args: self._on_trade_update(trade)
+        trade.statusEvent += lambda *args: self._on_trade_update(trade)
 
         self.last_trade_time = self._now()
         self.last_action = action
@@ -388,7 +400,6 @@ class StrategyRunner:
             self.entry_price = price
             self.entry_time = now
             pos_after = "LONG"
-            # [NEW] SAVE STATE
             save_state("LONG", qty, price, now)
             
         elif action == "SELL":
@@ -401,7 +412,6 @@ class StrategyRunner:
             self.entry_price = None
             self.entry_time = None
             pos_after = "NONE"
-            # [NEW] CLEAR STATE
             save_state("NONE", 0, 0.0, None)
         
         with self.lock:
@@ -418,7 +428,18 @@ class StrategyRunner:
         send_alert(msg, APP_NAME)
 
     # ─────────────────────────────────────────────────────────
-    # MARKET DATA & ACCOUNT
+    # ACCOUNT STREAM HANDLER (NEW PATTERN)
+    # ─────────────────────────────────────────────────────────
+    def _on_account_summary(self, val):
+        if val.tag == "TotalCashBalance":
+            if val.currency == "BASE" or val.currency == CURRENCY:
+                try:
+                    self.cached_cash_balance = float(val.value)
+                except ValueError: 
+                    pass
+
+    # ─────────────────────────────────────────────────────────
+    # MARKET DATA & MAIN TICK LOGIC
     # ─────────────────────────────────────────────────────────
     def _on_tick(self, _=None) -> None:
         if self._stop_requested or not self._ticker: return
@@ -429,7 +450,9 @@ class StrategyRunner:
         self.last_tick_check = now
 
         price = (self._ticker.last or self._ticker.marketPrice() or self._ticker.close or 0.0)
-        if price <= 0: return
+        
+        if (price != price) or price <= 0: 
+            return
 
         self.prices.append(price)
         if len(self.prices) > 100: self.prices = self.prices[-100:]
@@ -443,15 +466,19 @@ class StrategyRunner:
             self._write_heartbeat(status="waiting", last_price=price)
             return
 
-        qty = self._qty_for_price(price)
+        # ─────────────────────────────────────────────────────────────
+        # [FIX] USE CORRECT QUANTITY LOGIC FOR ENTRIES VS EXITS
+        # ─────────────────────────────────────────────────────────────
+        qty = 0
+        if action == "BUY":
+            qty = self._qty_for_price(price)   # Calculate size based on Capital
+        elif action == "SELL":
+            qty = self.current_qty             # Sell EVERYTHING we own (from JSON state)
+        
         if qty > 0:
             self._place_order(action, qty, price)
-
-    def _on_account_summary(self, val):
-        if val.tag == "TotalCashBalance" and val.currency == "BASE":
-            try:
-                self.account_cash_balance = float(val.value)
-            except: pass
+        else:
+            log_status(f"⚠️ Signal {action} ignored because Qty is 0 (Check Balance or Position State).")
 
     # ─────────────────────────────────────────────────────────
     # MAIN LOOP
@@ -470,20 +497,33 @@ class StrategyRunner:
                         self.ib.connect(HOST, PORT, clientId=CLIENT_ID, readonly=False)
                         self.ib.qualifyContracts(self.contract)
                         log_status("✅ Connected")
-                        send_alert(f"✅ <b>[{APP_NAME}]</b> Connected", APP_NAME)
+                        send_alert(f"✅ <b>[{APP_NAME}]</b> Connected (ID: {CLIENT_ID})", APP_NAME)
                     except Exception as e:
                         if "already in use" in str(e).lower():
                             CLIENT_ID = bump_client_id(APP_NAME, "strategy")
                             log_status(f"⚠️ Bumped Client ID to {CLIENT_ID}")
                         else:
                             log_status(f"❌ Connection failed: {e}")
-                        time.sleep(10)
-                        continue
+                            time.sleep(10)
+                            continue
 
-                # 2. SETUP & SUBSCRIBE
-                self.ib.reqAccountSummary()
+                # 2. SUBSCRIBE TO ACCOUNT UPDATES (NEW PATTERN)
+                # We subscribe ONCE using the Zero-Argument method
                 self.ib.accountSummaryEvent += self._on_account_summary
+                self.ib.reqAccountSummary() 
+                log_status("✅ Account Summary Stream Subscribed")
+
+                # 3. WARM-UP LOOP (Crucial!)
+                # Waits for cash balance data to arrive. No fallback.
+                log_status("⏳ Waiting for Cash Balance data...")
+                wait_count = 0
+                while self.cached_cash_balance <= 0 and wait_count < 50:
+                    self.ib.sleep(0.1)  # Keep connection alive while waiting
+                    wait_count += 1
                 
+                log_status(f"💰 Cash Balance Loaded: {self.cached_cash_balance:,.2f}")
+                
+                # 4. SUBSCRIBE TO MARKET DATA
                 if self._ticker: self.ib.cancelMktData(self.contract)
                 self._ticker = self.ib.reqMktData(self.contract, "", False, False)
                 self._ticker.updateEvent += self._on_tick
@@ -491,7 +531,7 @@ class StrategyRunner:
                 log_status("✅ Data Subscribed. Monitoring...")
                 self._write_heartbeat("running")
 
-                # 3. MONITOR LOOP
+                # 5. MONITOR LOOP
                 while self.ib.isConnected():
                     if self._stop_requested: break
                     self.ib.waitOnUpdate(timeout=1.0)
