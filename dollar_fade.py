@@ -6,6 +6,7 @@ Features:
 - ISOLATED STATE: Uses a JSON file to track positions (Safe for shared accounts)
 - Sustainable Logic (Throttled Ticks)
 - [FIXED] Timestamp Logging, Live Cash Stream, Timezone Safety
+- [NEW] Dynamic Business Day Logic (10 days left in year)
 """
 
 import os
@@ -53,14 +54,12 @@ SEC_TYPE = "FX"
 EXCHANGE = "IDEALPRO"       
 CURRENCY = "USD"
 
-# ─── STRATEGY DATES (Fixed Entry/Exit) ───
-# Entry: December 23rd
-ENTRY_MONTH = 1
-ENTRY_DAY = 2
+# ─── STRATEGY DATES (Dynamic Business Days) ───
+# Entry: When exactly 10 Business Days remain in the current year
+ENTRY_BIZ_DAYS_REMAINING = 10
 
-# Exit: January 2nd
-EXIT_MONTH = 1
-EXIT_DAY = 3
+# Exit: First 5 days of January
+EXIT_MAX_JAN_DAY = 5
 
 # ─── CAPITAL SIZING SETTINGS ───
 CAPITAL_MODE = "PERCENTAGE"      # "FIXED" or "PERCENTAGE"
@@ -305,7 +304,7 @@ class StrategyRunner:
     # [FIX] Relaxed Account Summary Handler
     def _on_account_summary(self, val):
         """
-        Stream handler for Account Summary. 
+        Stream handler for Account Summary.
         Updates cash balance whenever 'TotalCashBalance' is received.
         Removed strict 'val.account == ACCOUNT_ID' check to ensure we capture
         data even if casing mismatches or alias is used.
@@ -341,28 +340,42 @@ class StrategyRunner:
         return units
 
     # ─────────────────────────────
-    # STRATEGY LOGIC: FIXED DATES
+    # STRATEGY LOGIC: DYNAMIC BUSINESS DAYS
     # ─────────────────────────────
     def compute_signal(self, price: float) -> Optional[str]:
         now_et = self._now()
-        today_month = now_et.month
-        today_day = now_et.day
+        today_date = now_et.date()
         
-        # 1. EXIT LOGIC - January 2nd OR LATER
+        # 1. EXIT LOGIC - First 5 days of January
         if self.current_position == "LONG":
-            if today_month == EXIT_MONTH and today_day >= EXIT_DAY:
-                log_status(f"Exit signal triggered on {now_et.strftime('%Y-%m-%d')} (Jan {EXIT_DAY}+)")
-                return "SELL"
-            
-            if today_month > EXIT_MONTH and today_month != 12:
-                log_status(f"Late exit signal triggered on {now_et.strftime('%Y-%m-%d')}")
+            # Primary Exit: Jan 1 - Jan 5
+            if now_et.month == 1:
+                if now_et.day <= EXIT_MAX_JAN_DAY:
+                    log_status(f"Exit signal triggered on {now_et.strftime('%Y-%m-%d')} (Early Jan Exit)")
+                    return "SELL"
+                else:
+                    # Late Jan exit if we missed the window
+                    log_status(f"Late Jan exit signal triggered on {now_et.strftime('%Y-%m-%d')}")
+                    return "SELL"
+
+            # Safety Exit: If still long in Feb-Nov
+            if now_et.month > 1 and now_et.month != 12:
+                log_status(f"Late Safety Exit triggered on {now_et.strftime('%Y-%m-%d')}")
                 return "SELL"
         
-        # 2. ENTRY LOGIC - December 23rd ONLY
+        # 2. ENTRY LOGIC - Dynamic "Business Days Left"
         elif self.current_position == "NONE":
-            if today_month == ENTRY_MONTH and today_day == ENTRY_DAY:
-                log_status(f"Entry signal triggered on {now_et.strftime('%Y-%m-%d')} (Dec {ENTRY_DAY})")
-                return "BUY"
+            if now_et.month == 12:
+                # Calculate business days (M-F) remaining until Dec 31
+                end_of_year = dt.date(now_et.year, 12, 31)
+                
+                # pd.bdate_range counts business days inclusive of start/end
+                biz_days_range = pd.bdate_range(start=today_date, end=end_of_year)
+                days_remaining = len(biz_days_range)
+
+                if days_remaining == ENTRY_BIZ_DAYS_REMAINING:
+                    log_status(f"Entry signal triggered: {days_remaining} business days left in {now_et.year}.")
+                    return "BUY"
 
         return None
 
@@ -506,7 +519,7 @@ class StrategyRunner:
     def run(self) -> None:
         global CLIENT_ID
         
-        send_alert(f"🚀 <b>[{APP_NAME}]</b> Started.\nTarget: {ENTRY_MONTH}/{ENTRY_DAY} -> {EXIT_MONTH}/{EXIT_DAY}", APP_NAME)
+        send_alert(f"🚀 <b>[{APP_NAME}]</b> Started.\nTarget: {ENTRY_BIZ_DAYS_REMAINING} Biz Days Left -> Jan 1-{EXIT_MAX_JAN_DAY}", APP_NAME)
         
         while not self._stop_requested:
             try:
@@ -540,7 +553,7 @@ class StrategyRunner:
                             log_status(f"⚠️ Bumped Client ID to {CLIENT_ID}")
                         else:
                             log_status(f"❌ Connection failed: {e}")
-                        time.sleep(10)
+                            time.sleep(10)
                         continue
 
                 # 2. SETUP & SUBSCRIBE
